@@ -1,17 +1,30 @@
 [package]
 name = "omena-lsp-server"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-publish.workspace = true
-description = "Rust LSP server boundary scaffold for CSS Module Explainer"
-repository = "https://github.com/yongsk0066/css-module-explainer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Rust LSP server boundary and multi-editor runtime for Omena"
+repository = "https://github.com/omenien/omena-lsp-server"
+readme = "README.md"
+keywords = ["omena", "css-modules", "lsp", "language-server"]
+categories = ["development-tools"]
+exclude = [".github/**"]
 
-[lints]
-workspace = true
+[lib]
+name = "omena_lsp_server"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
 
 [dependencies]
-engine-style-parser = { path = "../engine-style-parser" }
-omena-tsgo-client = { path = "../omena-tsgo-client" }
-serde.workspace = true
-serde_json.workspace = true
+engine-style-parser = { package = "omena-engine-style-parser", version = "0.1.5" }
+omena-tsgo-client = "0.1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
