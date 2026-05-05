@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "omena-lsp-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "omena-incremental",
  "omena-query",
