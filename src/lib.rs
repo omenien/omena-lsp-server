@@ -1,10 +1,47 @@
-use engine_style_parser::{
-    ParserByteSpanV0, ParserPositionV0, ParserRangeV0, RulePayload, SelectorSegment, StyleLanguage,
-    SyntaxNode, SyntaxNodePayload, TextSpan, parse_style_module,
-    summarize_css_modules_intermediate,
+mod diagnostics_scheduler;
+mod query_reuse;
+mod workspace_runtime_registry;
+
+use diagnostics_scheduler::{
+    RustDiagnosticsSchedulerBoundaryV0, diagnostics_schedule_event, run_diagnostics_schedule,
+    rust_diagnostics_scheduler_contract,
+};
+use engine_style_parser::{ParserByteSpanV0, ParserPositionV0, ParserRangeV0, StyleLanguage};
+use omena_bridge::{
+    SourceImportedStyleBindingV0 as ImportedStyleBinding,
+    SourceSelectorReferenceFactV0 as SourceSelectorReferenceFact,
+    SourceSelectorReferenceMatchKindV0 as SourceSelectorReferenceMatchKind,
+    SourceSyntaxIndexV0 as SourceSyntaxIndex, SourceTypeFactTargetV0 as SourceTypeFactTarget,
+    canonicalize_source_selector_references, resolve_omena_bridge_style_uri_for_specifier,
+    summarize_omena_bridge_source_syntax_index,
 };
 use omena_incremental::IncrementalCancellationRegistryV0;
-use omena_tsgo_client::{OmenaTsgoClientBoundarySummaryV0, summarize_omena_tsgo_client_boundary};
+use omena_query::{
+    OmenaQuerySourceSelectorCandidateV0, OmenaQuerySourceSelectorReferenceEditTargetV0,
+    OmenaQueryStyleHoverCandidateV0, OmenaQueryStyleSelectorDefinitionV0,
+    is_omena_query_sass_symbol_candidate_kind as is_sass_symbol_candidate_kind,
+    is_omena_query_sass_symbol_declaration_kind as is_sass_symbol_declaration_kind,
+    is_omena_query_sass_symbol_reference_kind as is_sass_symbol_reference_kind,
+    omena_query_sass_symbol_kind_from_candidate_kind as sass_symbol_kind_from_candidate_kind,
+    omena_query_sass_symbol_target_matches, resolve_omena_query_sass_forward_sources,
+    resolve_omena_query_sass_module_use_sources_for_candidate,
+    resolve_omena_query_sass_symbol_declarations, resolve_omena_query_selector_rename_edits,
+    resolve_omena_query_source_candidate_selector_names,
+    resolve_omena_query_source_provider_candidates,
+    resolve_omena_query_style_selector_definitions_for_source_candidate,
+    summarize_omena_query_missing_custom_property_diagnostics,
+    summarize_omena_query_missing_selector_diagnostic, summarize_omena_query_sass_module_sources,
+    summarize_omena_query_style_document, summarize_omena_query_style_hover_candidates,
+    summarize_omena_query_style_hover_render_parts,
+};
+use omena_tsgo_client::{
+    OmenaTsgoClientBoundarySummaryV0, TsgoJsonRpcTypeFactProviderV0, TsgoResolvedTypeV0,
+    TsgoTypeFactRequestV0, TsgoTypeFactResultEntryV0, TsgoTypeFactTargetV0,
+    TsgoWorkspaceProcessPoolV0, build_tsgo_process_command, summarize_omena_tsgo_client_boundary,
+};
+use query_reuse::{
+    RustQueryReuseBoundaryV0, refresh_document_reusable_indexes, rust_query_reuse_contract,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -12,6 +49,10 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use workspace_runtime_registry::{
+    WorkspaceRuntimeRegistry, WorkspaceRuntimeRegistryBoundaryV0,
+    workspace_runtime_registry_contract,
 };
 
 pub const NODE_TEXT_DOCUMENT_SYNC_KIND: u8 = 2;
@@ -40,7 +81,11 @@ pub struct OmenaLspServerBoundarySummaryV0 {
     pub blocking_work_policy: Vec<&'static str>,
     pub tsgo_client_boundary: OmenaTsgoClientBoundarySummaryV0,
     pub source_provider_adapter: SourceProviderDirectRustAdapterV0,
+    pub workspace_runtime_registry: WorkspaceRuntimeRegistryBoundaryV0,
+    pub diagnostics_scheduler: RustDiagnosticsSchedulerBoundaryV0,
+    pub query_reuse: RustQueryReuseBoundaryV0,
     pub thin_client_endpoint: ThinClientEndpointV0,
+    pub multi_editor_distribution: MultiEditorDistributionV0,
     pub node_parity_contracts: Vec<&'static str>,
     pub next_decoupling_targets: Vec<&'static str>,
 }
@@ -122,10 +167,25 @@ pub struct ThinClientEndpointV0 {
     pub endpoint_name: &'static str,
     pub transport_contract: &'static str,
     pub command_owner: &'static str,
+    pub standalone_package: &'static str,
+    pub split_repository: &'static str,
+    pub cargo_install_command: &'static str,
     pub node_fallback_allowed: bool,
     pub file_watcher_globs: Vec<&'static str>,
     pub host_responsibilities: Vec<&'static str>,
     pub rust_responsibilities: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiEditorDistributionV0 {
+    pub product: &'static str,
+    pub owner: &'static str,
+    pub distribution_model: &'static str,
+    pub supported_editors: Vec<&'static str>,
+    pub install_surfaces: Vec<&'static str>,
+    pub documentation: Vec<&'static str>,
+    pub endpoint_policy: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,7 +217,11 @@ pub fn summarize_omena_lsp_server_boundary() -> OmenaLspServerBoundarySummaryV0 
         ],
         tsgo_client_boundary: summarize_omena_tsgo_client_boundary(),
         source_provider_adapter: source_provider_direct_rust_adapter_contract(),
+        workspace_runtime_registry: workspace_runtime_registry_contract(),
+        diagnostics_scheduler: rust_diagnostics_scheduler_contract(),
+        query_reuse: rust_query_reuse_contract(),
         thin_client_endpoint: thin_client_endpoint_contract(),
+        multi_editor_distribution: multi_editor_distribution_contract(),
         node_parity_contracts: vec![
             "initializeCapabilities",
             "textDocumentSync",
@@ -166,25 +230,24 @@ pub fn summarize_omena_lsp_server_boundary() -> OmenaLspServerBoundarySummaryV0 
             "diagnosticsPush",
             "codeLensRefresh",
         ],
-        next_decoupling_targets: vec![
-            "rustWorkspaceRuntimeRegistry",
-            "rustDiagnosticsScheduler",
-            "tsgoJsonRpcProviderImplementation",
-            "incrementalQueryReuse",
-            "thinVsCodeClientHost",
-            "multiEditorDistribution",
-        ],
+        next_decoupling_targets: vec![],
     }
 }
 
 pub fn source_provider_direct_rust_adapter_contract() -> SourceProviderDirectRustAdapterV0 {
     SourceProviderDirectRustAdapterV0 {
         product: "omena-lsp-server.source-provider-direct-rust-adapter",
-        candidate_owner: "omena-lsp-server/openedSourceDocumentIndex",
-        style_definition_owner: "omena-lsp-server/openedStyleDocumentIndex",
+        candidate_owner: "omena-bridge/sourceSyntaxIndex",
+        style_definition_owner: "omena-query/styleHoverCandidates",
         type_fact_owner: "omena-tsgo-client",
         request_path_policy: vec![
             "noNodeWorkspaceTypeResolverOnSourceProviderPath",
+            "buildBridgeSourceSyntaxIndexOnDocumentChange",
+            "dedupeTargetAwareSourceCandidates",
+            "consumeQueryStyleHoverCandidates",
+            "consumeQuerySassModuleSources",
+            "consumeTsgoTypeFactsForTypedCxProjection",
+            "consumeSassPartialEvaluatorGeneratedSelectors",
             "useOpenedDocumentIndexesBeforeWorkspaceFallback",
             "unresolvedCandidatesRemainFastDiagnostics",
         ],
@@ -204,6 +267,9 @@ pub fn thin_client_endpoint_contract() -> ThinClientEndpointV0 {
         endpoint_name: "css-module-explainer.thin-client-runtime-endpoint",
         transport_contract: "LSP stdio JSON-RPC",
         command_owner: "dist/bin/<platform>-<arch>/omena-lsp-server",
+        standalone_package: "omena-lsp-server",
+        split_repository: "https://github.com/omenien/omena-lsp-server",
+        cargo_install_command: "cargo install omena-lsp-server --version 0.1.3",
         node_fallback_allowed: false,
         file_watcher_globs: vec![
             "**/*.module.{scss,css,less}",
@@ -213,6 +279,9 @@ pub fn thin_client_endpoint_contract() -> ThinClientEndpointV0 {
         ],
         host_responsibilities: vec![
             "resolvePackagedRustBinary",
+            "resolveStandaloneRustCommand",
+            "buildThinClientServerOptions",
+            "declareStaticDocumentSelector",
             "startLanguageClient",
             "registerStaticFileWatchers",
             "translateShowReferencesArguments",
@@ -224,6 +293,31 @@ pub fn thin_client_endpoint_contract() -> ThinClientEndpointV0 {
             "ownDiagnosticsScheduling",
             "ownProviderExecution",
             "ownTsgoClientLifecycle",
+        ],
+    }
+}
+
+pub fn multi_editor_distribution_contract() -> MultiEditorDistributionV0 {
+    MultiEditorDistributionV0 {
+        product: "omena-lsp-server.multi-editor-distribution",
+        owner: "omena-lsp-server/distribution",
+        distribution_model: "standaloneRustLspServerWithThinEditorHosts",
+        supported_editors: vec!["vscode", "neovim", "zed"],
+        install_surfaces: vec![
+            "vsixBundledDistBinary",
+            "cargoInstallOmenaLspServer",
+            "repoLocalDistBin",
+        ],
+        documentation: vec![
+            "client/src/extension.ts",
+            "docs/clients/neovim.md",
+            "docs/clients/zed.md",
+        ],
+        endpoint_policy: vec![
+            "standaloneRustServerIsPrimaryMultiEditorEndpoint",
+            "nodeLspServerIsNotPrimaryEndpoint",
+            "editorClientsDoNotImplementProviderSemantics",
+            "editorsMayRunBesideNativeTypeScriptServer",
         ],
     }
 }
@@ -348,6 +442,8 @@ pub struct LspTextDocumentState {
     #[serde(skip)]
     pub style_candidates: Vec<LspStyleHoverCandidate>,
     #[serde(skip)]
+    source_syntax_index: SourceSyntaxIndex,
+    #[serde(skip)]
     pub source_selector_candidates: Vec<LspStyleHoverCandidate>,
 }
 
@@ -385,6 +481,8 @@ pub struct LspStyleHoverCandidate {
     pub source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_style_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,7 +557,7 @@ impl Default for LspDiagnosticSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct LspShellState {
     pub shutdown_requested: bool,
     pub should_exit: bool,
@@ -470,7 +568,8 @@ pub struct LspShellState {
     configuration_change_count: usize,
     documents: BTreeMap<String, LspTextDocumentState>,
     open_document_uris: BTreeSet<String>,
-    workspace_folders: BTreeMap<String, LspWorkspaceFolderState>,
+    workspace_runtime_registry: WorkspaceRuntimeRegistry,
+    tsgo_workspace_process_pool: TsgoWorkspaceProcessPoolV0,
     watched_file_changes: Vec<LspWatchedFileChangeState>,
 }
 
@@ -480,7 +579,7 @@ impl LspShellState {
     }
 
     pub fn workspace_folder_count(&self) -> usize {
-        self.workspace_folders.len()
+        self.workspace_runtime_registry.len()
     }
 
     pub fn document(&self, uri: &str) -> Option<&LspTextDocumentState> {
@@ -488,7 +587,7 @@ impl LspShellState {
     }
 
     pub fn workspace_folder(&self, uri: &str) -> Option<&LspWorkspaceFolderState> {
-        self.workspace_folders.get(uri)
+        self.workspace_runtime_registry.get(uri)
     }
 
     pub fn snapshot(&self) -> LspShellStateSnapshot {
@@ -504,7 +603,7 @@ impl LspShellState {
             configuration_change_count: self.configuration_change_count,
             watched_file_event_count: self.watched_file_changes.len(),
             documents: self.documents.values().cloned().collect(),
-            workspace_folders: self.workspace_folders.values().cloned().collect(),
+            workspace_folders: self.workspace_runtime_registry.folder_snapshots(),
             watched_file_changes: self.watched_file_changes.clone(),
         }
     }
@@ -714,98 +813,19 @@ pub fn handle_lsp_message_outputs(state: &mut LspShellState, message: Value) -> 
         .and_then(Value::as_str)
         .map(str::to_string);
     let watched_file_uris = watched_file_uris_from_message(&message);
+    let diagnostics_event =
+        diagnostics_schedule_event(method.as_deref(), document_uri, watched_file_uris);
     let mut outputs = Vec::new();
 
     if let Some(response) = handle_lsp_message(state, message) {
         outputs.push(response);
     }
 
-    if matches!(
-        method.as_deref(),
-        Some("textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose")
-    ) && let Some(uri) = document_uri
-    {
-        let is_close = method.as_deref() == Some("textDocument/didClose");
-        outputs.push(publish_diagnostics_notification(
-            uri.as_str(),
-            if is_close {
-                json!([])
-            } else {
-                resolve_document_diagnostics_for_uri(state, uri.as_str())
-            },
-        ));
-
-        if is_style_document_uri(uri.as_str()) {
-            let source_uris: Vec<String> = state
-                .documents
-                .values()
-                .filter(|document| !is_style_document_uri(document.uri.as_str()))
-                .filter(|document| {
-                    state.document(uri.as_str()).is_none_or(|style_document| {
-                        workspace_folder_compatible(
-                            style_document.workspace_folder_uri.as_deref(),
-                            document,
-                        )
-                    })
-                })
-                .map(|document| document.uri.clone())
-                .collect();
-            for source_uri in source_uris {
-                outputs.push(publish_diagnostics_notification(
-                    source_uri.as_str(),
-                    resolve_source_diagnostics_for_uri(state, source_uri.as_str()),
-                ));
-            }
-        }
-    }
-    if method.as_deref() == Some("workspace/didChangeWatchedFiles") {
-        let mut source_uris_to_refresh = BTreeSet::new();
-        for uri in watched_file_uris
-            .into_iter()
-            .filter(|uri| is_style_document_uri(uri.as_str()))
-        {
-            outputs.push(publish_diagnostics_notification(
-                uri.as_str(),
-                resolve_document_diagnostics_for_uri(state, uri.as_str()),
-            ));
-            for source_uri in source_uris_for_style_change_diagnostics(state, uri.as_str()) {
-                source_uris_to_refresh.insert(source_uri);
-            }
-        }
-        for source_uri in source_uris_to_refresh {
-            outputs.push(publish_diagnostics_notification(
-                source_uri.as_str(),
-                resolve_source_diagnostics_for_uri(state, source_uri.as_str()),
-            ));
-        }
-    }
-    if method.as_deref() == Some("workspace/didChangeConfiguration") {
-        for uri in open_document_uris_for_diagnostics(state) {
-            outputs.push(publish_diagnostics_notification(
-                uri.as_str(),
-                resolve_document_diagnostics_for_uri(state, uri.as_str()),
-            ));
-        }
-    }
-    if method.as_deref() == Some("initialized") {
-        for uri in open_document_uris_for_diagnostics(state) {
-            outputs.push(publish_diagnostics_notification(
-                uri.as_str(),
-                resolve_document_diagnostics_for_uri(state, uri.as_str()),
-            ));
-        }
+    if let Some(event) = diagnostics_event {
+        outputs.extend(run_diagnostics_schedule(state, event));
     }
 
     outputs
-}
-
-fn open_document_uris_for_diagnostics(state: &LspShellState) -> Vec<String> {
-    state
-        .open_document_uris
-        .iter()
-        .filter(|uri| state.documents.contains_key(uri.as_str()))
-        .cloned()
-        .collect()
 }
 
 fn current_time_millis() -> u128 {
@@ -829,37 +849,8 @@ fn watched_file_uris_from_message(message: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn source_uris_for_style_change_diagnostics(state: &LspShellState, style_uri: &str) -> Vec<String> {
-    let workspace_folder_uri = state
-        .document(style_uri)
-        .and_then(|document| document.workspace_folder_uri.clone())
-        .or_else(|| resolve_workspace_folder_uri(state, style_uri));
-    state
-        .documents
-        .values()
-        .filter(|document| !is_style_document_uri(document.uri.as_str()))
-        .filter(|document| {
-            workspace_folder_uri.as_deref().is_none_or(|workspace_uri| {
-                workspace_folder_compatible(Some(workspace_uri), document)
-            })
-        })
-        .map(|document| document.uri.clone())
-        .collect()
-}
-
-fn publish_diagnostics_notification(uri: &str, diagnostics: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/publishDiagnostics",
-        "params": {
-            "uri": uri,
-            "diagnostics": diagnostics,
-        },
-    })
-}
-
 fn initialize_workspace_folders(state: &mut LspShellState, params: Option<&Value>) {
-    state.workspace_folders.clear();
+    state.workspace_runtime_registry.clear();
     if let Some(folders) = params
         .and_then(|value| value.get("workspaceFolders"))
         .and_then(Value::as_array)
@@ -874,13 +865,9 @@ fn initialize_workspace_folders(state: &mut LspShellState, params: Option<&Value
         .and_then(|value| value.get("rootUri"))
         .and_then(Value::as_str)
     {
-        state.workspace_folders.insert(
-            root_uri.to_string(),
-            LspWorkspaceFolderState {
-                uri: root_uri.to_string(),
-                name: root_uri.to_string(),
-            },
-        );
+        state
+            .workspace_runtime_registry
+            .insert(root_uri.to_string(), root_uri.to_string());
     }
 }
 
@@ -893,7 +880,7 @@ fn index_workspace_style_files_with_budget(
     state: &mut LspShellState,
     budget: &mut WorkspaceStyleIndexBudget,
 ) {
-    let folders: Vec<LspWorkspaceFolderState> = state.workspace_folders.values().cloned().collect();
+    let folders = state.workspace_runtime_registry.folder_snapshots();
     for folder in folders {
         if budget.should_stop() {
             break;
@@ -1072,20 +1059,11 @@ fn lsp_text_document_state(
         text,
         style_summary: None,
         style_candidates: Vec::new(),
+        source_syntax_index: SourceSyntaxIndex::default(),
         source_selector_candidates: Vec::new(),
     };
-    refresh_document_indexes(&mut document);
+    refresh_document_reusable_indexes(&mut document);
     document
-}
-
-fn refresh_document_indexes(document: &mut LspTextDocumentState) {
-    document.style_summary =
-        summarize_style_document(document.uri.as_str(), Some(document.text.as_str()));
-    document.style_candidates =
-        collect_style_hover_candidates(document.uri.as_str(), document.text.as_str())
-            .map(|(_, candidates)| candidates)
-            .unwrap_or_default();
-    document.source_selector_candidates = scan_source_class_reference_candidates(document);
 }
 
 fn did_open_text_document(state: &mut LspShellState, params: Option<&Value>) {
@@ -1115,6 +1093,7 @@ fn did_open_text_document(state: &mut LspShellState, params: Option<&Value>) {
                 .to_string(),
         ),
     );
+    refresh_source_type_fact_candidates_for_document(state, uri);
 }
 
 fn did_change_text_document(state: &mut LspShellState, params: Option<&Value>) {
@@ -1145,8 +1124,204 @@ fn did_change_text_document(state: &mut LspShellState, params: Option<&Value>) {
         }
     }
     if text_changed {
-        refresh_document_indexes(existing);
+        refresh_document_reusable_indexes(existing);
     }
+    if text_changed {
+        refresh_source_type_fact_candidates_for_document(state, uri);
+    }
+}
+
+fn refresh_source_type_fact_candidates_for_document(state: &mut LspShellState, uri: &str) {
+    let Some(document) = state.document(uri) else {
+        return;
+    };
+    if is_style_document_uri(document.uri.as_str()) {
+        return;
+    }
+    let type_fact_targets = document.source_syntax_index.type_fact_targets.clone();
+    if type_fact_targets.is_empty() {
+        return;
+    }
+    let Some(request) = tsgo_type_fact_request_for_document(document, type_fact_targets.as_slice())
+    else {
+        return;
+    };
+    let Some(tsgo_command) = tsgo_process_command_for_workspace(request.workspace_root.as_str())
+    else {
+        return;
+    };
+    let config = omena_tsgo_client::TsgoWorkspaceProcessConfigV0 {
+        workspace_root: request.workspace_root.clone(),
+        command: tsgo_command,
+    };
+    if state
+        .tsgo_workspace_process_pool
+        .ensure_workspace_process(config)
+        .is_err()
+    {
+        return;
+    }
+
+    let pool = std::mem::take(&mut state.tsgo_workspace_process_pool);
+    let mut provider = TsgoJsonRpcTypeFactProviderV0::new(pool);
+    let entries = provider.collect_type_facts(&request).ok();
+    state.tsgo_workspace_process_pool = provider.into_transport();
+    let Some(entries) = entries else {
+        return;
+    };
+    apply_source_type_fact_results_to_document(state, uri, entries.as_slice());
+}
+
+fn tsgo_type_fact_request_for_document(
+    document: &LspTextDocumentState,
+    type_fact_targets: &[SourceTypeFactTarget],
+) -> Option<TsgoTypeFactRequestV0> {
+    let file_path = file_uri_to_path(document.uri.as_str())?;
+    let workspace_root = document
+        .workspace_folder_uri
+        .as_deref()
+        .and_then(file_uri_to_path)
+        .or_else(|| file_path.parent().map(Path::to_path_buf))?;
+    let config_path = find_tsconfig_for_workspace(workspace_root.as_path())?;
+    let file_path = file_path.to_string_lossy().to_string();
+    let targets = type_fact_targets
+        .iter()
+        .filter_map(|target| {
+            let position = u32::try_from(target.byte_span.start).ok()?;
+            Some(TsgoTypeFactTargetV0 {
+                file_path: file_path.clone(),
+                expression_id: target.expression_id.clone(),
+                position,
+            })
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return None;
+    }
+    Some(TsgoTypeFactRequestV0 {
+        workspace_root: workspace_root.to_string_lossy().to_string(),
+        config_path: config_path.to_string_lossy().to_string(),
+        targets,
+    })
+}
+
+fn apply_source_type_fact_results_to_document(
+    state: &mut LspShellState,
+    uri: &str,
+    entries: &[TsgoTypeFactResultEntryV0],
+) {
+    let Some(document) = state.document(uri) else {
+        return;
+    };
+    let mut references = document.source_syntax_index.selector_references.clone();
+    let targets = document.source_syntax_index.type_fact_targets.clone();
+    for target in targets {
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.expression_id == target.expression_id)
+        else {
+            continue;
+        };
+        for selector_name in project_tsgo_type_fact_target(entry.resolved_type.clone(), &target) {
+            push_selector_reference(
+                target.byte_span,
+                Some(selector_name),
+                SourceSelectorReferenceMatchKind::Exact,
+                target.target_style_uri.as_deref(),
+                &mut references,
+            );
+        }
+    }
+    canonicalize_source_selector_references(&mut references);
+    let Some(document) = state.documents.get_mut(uri) else {
+        return;
+    };
+    document.source_syntax_index.selector_references = references;
+    let source_syntax_index = document.source_syntax_index.clone();
+    document.source_selector_candidates =
+        source_selector_candidates_from_index(document, &source_syntax_index);
+}
+
+fn project_tsgo_type_fact_target(
+    resolved_type: TsgoResolvedTypeV0,
+    target: &SourceTypeFactTarget,
+) -> Vec<String> {
+    if resolved_type.kind != "union" {
+        return Vec::new();
+    }
+    let mut names = resolved_type
+        .values
+        .into_iter()
+        .filter(|value| value.chars().all(is_css_identifier_continue))
+        .map(|value| format!("{}{}{}", target.prefix, value, target.suffix))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn push_selector_reference(
+    byte_span: ParserByteSpanV0,
+    selector_name: Option<String>,
+    match_kind: SourceSelectorReferenceMatchKind,
+    target_style_uri: Option<&str>,
+    references: &mut Vec<SourceSelectorReferenceFact>,
+) {
+    references.push(SourceSelectorReferenceFact {
+        byte_span,
+        selector_name,
+        match_kind,
+        target_style_uri: target_style_uri.map(ToString::to_string),
+    });
+}
+
+fn find_tsconfig_for_workspace(workspace_root: &Path) -> Option<PathBuf> {
+    let mut current = Some(workspace_root);
+    while let Some(dir) = current {
+        for file_name in ["tsconfig.json", "jsconfig.json"] {
+            let candidate = dir.join(file_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn tsgo_process_command_for_workspace(
+    workspace_root: &str,
+) -> Option<omena_tsgo_client::TsgoProcessCommandV0> {
+    let tsgo_path = resolve_tsgo_binary_path()?;
+    Some(build_tsgo_process_command(
+        tsgo_path.to_string_lossy().as_ref(),
+        workspace_root,
+        std::env::var("CME_TSGO_CHECKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok()),
+    ))
+}
+
+fn resolve_tsgo_binary_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("CME_TSGO_PATH")
+        && !path.is_empty()
+    {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let binary_name = if cfg!(windows) { "tsgo.exe" } else { "tsgo" };
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(binary_name)));
+    if let Some(path) = sibling
+        && path.exists()
+    {
+        return Some(path);
+    }
+    None
 }
 
 fn apply_text_document_content_change(document: &mut LspTextDocumentState, change: &Value) -> bool {
@@ -1197,7 +1372,7 @@ fn did_change_workspace_folders(state: &mut LspShellState, params: Option<&Value
     {
         for folder in removed {
             if let Some(uri) = folder.get("uri").and_then(Value::as_str) {
-                state.workspace_folders.remove(uri);
+                state.workspace_runtime_registry.remove(uri);
                 remove_indexed_documents_for_workspace(state, uri);
             }
         }
@@ -1339,59 +1514,41 @@ fn insert_workspace_folder(state: &mut LspShellState, folder: &Value) {
     let Some(uri) = folder.get("uri").and_then(Value::as_str) else {
         return;
     };
-    state.workspace_folders.insert(
+    state.workspace_runtime_registry.insert(
         uri.to_string(),
-        LspWorkspaceFolderState {
-            uri: uri.to_string(),
-            name: folder
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(uri)
-                .to_string(),
-        },
+        folder
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(uri)
+            .to_string(),
     );
 }
 
 fn refresh_document_workspace_owners(state: &mut LspShellState) {
-    let workspace_folders = state.workspace_folders.clone();
+    let workspace_runtime_registry = state.workspace_runtime_registry.clone();
     for document in state.documents.values_mut() {
         document.workspace_folder_uri =
-            resolve_workspace_folder_uri_from_map(&workspace_folders, document.uri.as_str());
+            workspace_runtime_registry.resolve_owner_uri(document.uri.as_str());
     }
 }
 
 fn resolve_workspace_folder_uri(state: &LspShellState, document_uri: &str) -> Option<String> {
-    resolve_workspace_folder_uri_from_map(&state.workspace_folders, document_uri)
-}
-
-fn resolve_workspace_folder_uri_from_map(
-    workspace_folders: &BTreeMap<String, LspWorkspaceFolderState>,
-    document_uri: &str,
-) -> Option<String> {
-    workspace_folders
-        .keys()
-        .filter(|workspace_uri| {
-            document_uri == workspace_uri.as_str()
-                || document_uri
-                    .strip_prefix(workspace_uri.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
-        .max_by_key(|workspace_uri| workspace_uri.len())
-        .cloned()
+    state
+        .workspace_runtime_registry
+        .resolve_owner_uri(document_uri)
 }
 
 fn summarize_style_document(uri: &str, text: Option<&str>) -> Option<LspStyleDocumentSummary> {
     let text = text?;
-    let sheet = parse_style_module(uri, text)?;
-    let index = summarize_css_modules_intermediate(&sheet);
+    let summary = summarize_omena_query_style_document(uri, text)?;
     Some(LspStyleDocumentSummary {
-        language: style_language_label(sheet.language),
-        selector_names: index.selectors.names,
-        custom_property_decl_names: index.custom_properties.decl_names,
-        custom_property_ref_names: index.custom_properties.ref_names,
-        sass_module_use_sources: index.sass.module_use_sources,
-        sass_module_forward_sources: index.sass.module_forward_sources,
-        diagnostic_count: sheet.diagnostics.len(),
+        language: summary.language,
+        selector_names: summary.selector_names,
+        custom_property_decl_names: summary.custom_property_decl_names,
+        custom_property_ref_names: summary.custom_property_ref_names,
+        sass_module_use_sources: summary.sass_module_use_sources,
+        sass_module_forward_sources: summary.sass_module_forward_sources,
+        diagnostic_count: summary.diagnostic_count,
     })
 }
 
@@ -1436,6 +1593,24 @@ fn style_hover_candidates_for_document(
     Some((summary.language, document.style_candidates.clone()))
 }
 
+fn style_text_for_uri(state: &LspShellState, uri: &str) -> Option<String> {
+    state
+        .document(uri)
+        .map(|document| document.text.clone())
+        .or_else(|| fs::read_to_string(file_uri_to_path(uri)?).ok())
+}
+
+fn style_hover_candidates_for_uri(
+    state: &LspShellState,
+    uri: &str,
+) -> Option<(&'static str, Vec<LspStyleHoverCandidate>)> {
+    if let Some(document) = state.document(uri) {
+        return style_hover_candidates_for_document(document);
+    }
+    let text = style_text_for_uri(state, uri)?;
+    collect_style_hover_candidates(uri, text.as_str())
+}
+
 fn resolve_lsp_definition(state: &LspShellState, params: Option<&Value>) -> Value {
     let document_uri = document_uri_from_params(params);
     let Some(position) = lsp_position_from_params(params) else {
@@ -1457,6 +1632,18 @@ fn resolve_lsp_definition(state: &LspShellState, params: Option<&Value>) -> Valu
     else {
         return Value::Null;
     };
+    if is_sass_symbol_reference_kind(candidate.kind) {
+        let definitions = sass_symbol_definitions_for_candidate(state, document, candidate);
+        if definitions.is_empty() {
+            return Value::Null;
+        }
+        return json!(
+            definitions
+                .into_iter()
+                .map(|(uri, definition)| json!({ "uri": uri, "range": definition.range }))
+                .collect::<Vec<_>>()
+        );
+    }
     let target = if candidate.kind == "customPropertyReference" {
         candidates
             .iter()
@@ -1508,6 +1695,22 @@ fn resolve_lsp_references(state: &LspShellState, params: Option<&Value>) -> Valu
             })
             .map(|target| json!({ "uri": document.uri.as_str(), "range": target.range }))
             .collect()
+    } else if is_sass_symbol_candidate_kind(candidate.kind) {
+        let mut locations = Vec::new();
+        if include_declaration {
+            locations.extend(
+                sass_symbol_definitions_for_candidate(state, document, candidate)
+                    .into_iter()
+                    .map(|(uri, definition)| json!({ "uri": uri, "range": definition.range })),
+            );
+        }
+        locations.extend(
+            candidates
+                .iter()
+                .filter(|target| sass_symbol_reference_matches(candidate, target))
+                .map(|target| json!({ "uri": document.uri.as_str(), "range": target.range })),
+        );
+        locations
     } else if candidate.kind == "selector" {
         let mut locations = if include_declaration {
             vec![json!({ "uri": document.uri.as_str(), "range": candidate.range })]
@@ -1559,11 +1762,9 @@ fn resolve_lsp_completion(state: &LspShellState, params: Option<&Value>) -> Valu
         .iter()
         .filter_map(|candidate| match candidate.kind {
             "selector" => Some((format!(".{}", candidate.name), 7, "CSS Module selector")),
-            "customPropertyDeclaration" => Some((
-                candidate.name.clone(),
-                10,
-                "CSS custom property from opened style document index",
-            )),
+            "customPropertyDeclaration" => {
+                Some((candidate.name.clone(), 10, "CSS custom property"))
+            }
             _ => None,
         })
         .filter(|(label, _, _)| emitted_labels.insert(label.clone()))
@@ -1611,42 +1812,35 @@ fn resolve_style_diagnostics_for_uri(state: &LspShellState, document_uri: &str) 
         return json!([]);
     };
 
-    let decl_names: BTreeSet<&str> = candidates
+    let query_candidates = candidates
         .iter()
-        .filter(|candidate| candidate.kind == "customPropertyDeclaration")
-        .map(|candidate| candidate.name.as_str())
-        .collect();
-    if decl_names.is_empty() {
-        return json!([]);
-    }
-
-    let insertion_range = end_of_document_range(document.text.as_str());
-    let diagnostics: Vec<Value> = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.kind == "customPropertyReference"
-                && !decl_names.contains(candidate.name.as_str())
-        })
-        .map(|candidate| {
-            json!({
-                "range": candidate.range,
-                "severity": state.diagnostics.severity,
-                "source": "css-module-explainer",
-                "message": format!(
-                    "CSS custom property '{}' not found in indexed style tokens.",
-                    candidate.name
-                ),
-                "data": {
-                    "createCustomProperty": {
-                        "uri": document.uri.as_str(),
-                        "range": insertion_range,
-                        "newText": format!("\n\n:root {{\n  {}: ;\n}}\n", candidate.name),
-                        "propertyName": candidate.name.as_str(),
-                    },
-                },
+        .map(query_style_hover_candidate_from_lsp)
+        .collect::<Vec<_>>();
+    let diagnostics = summarize_omena_query_missing_custom_property_diagnostics(
+        document.uri.as_str(),
+        document.text.as_str(),
+        query_candidates.as_slice(),
+    )
+    .into_iter()
+    .map(|diagnostic| {
+        let data = diagnostic
+            .create_custom_property
+            .map(|create_custom_property| {
+                json!({
+                    "createCustomProperty": create_custom_property,
+                })
             })
+            .unwrap_or_else(|| json!({}));
+
+        json!({
+            "range": diagnostic.range,
+            "severity": state.diagnostics.severity,
+            "source": "css-module-explainer",
+            "message": diagnostic.message,
+            "data": data,
         })
-        .collect();
+    })
+    .collect::<Vec<_>>();
 
     json!(diagnostics)
 }
@@ -1662,34 +1856,31 @@ fn resolve_source_diagnostics_for_uri(state: &LspShellState, document_uri: &str)
     let diagnostics: Vec<Value> = resolve_source_provider_candidates(state, document)
         .unresolved
         .into_iter()
+        .filter(|candidate| candidate.kind == "sourceSelectorReference")
         .filter_map(|candidate| {
             let (target_style_uri, target_style_document) = source_selector_diagnostic_target(
                 state,
                 &candidate,
                 document.workspace_folder_uri.as_deref(),
             )?;
-            let insertion_range = end_of_document_range(target_style_document.text.as_str());
-            let has_existing_style_content = !target_style_document.text.trim().is_empty();
+            let diagnostic = summarize_omena_query_missing_selector_diagnostic(
+                target_style_uri.as_str(),
+                target_style_document.text.as_str(),
+                candidate.name.as_str(),
+                candidate.range,
+            );
+            let data = diagnostic.create_selector.map(|create_selector| {
+                json!({
+                    "createSelector": create_selector,
+                })
+            })?;
+
             Some(json!({
-                "range": candidate.range,
+                "range": diagnostic.range,
                 "severity": state.diagnostics.severity,
                 "source": "css-module-explainer",
-                "message": format!(
-                    "CSS Module selector '.{}' not found in indexed style tokens.",
-                    candidate.name
-                ),
-                "data": {
-                    "createSelector": {
-                        "uri": target_style_uri.as_str(),
-                        "range": insertion_range,
-                        "newText": if has_existing_style_content {
-                            format!("\n\n.{} {{\n}}\n", candidate.name)
-                        } else {
-                            format!(".{} {{\n}}\n", candidate.name)
-                        },
-                        "selectorName": candidate.name.as_str(),
-                    },
-                },
+                "message": diagnostic.message,
+                "data": data,
             }))
         })
         .collect();
@@ -1786,7 +1977,7 @@ fn resolve_lsp_code_actions(params: Option<&Value>) -> Value {
                     "changes": Value::Object(changes),
                 },
                 "data": {
-                    "source": "openedSourceDocumentIndex",
+                    "source": "omenaBridgeSourceSyntaxIndex",
                     "diagnosticIndex": index,
                 },
             }))
@@ -1877,6 +2068,8 @@ fn selector_reference_locations_by_name_from_open_documents(
     target_style_uri: Option<&str>,
 ) -> BTreeMap<String, Vec<Value>> {
     let mut locations_by_name: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let definitions =
+        style_selector_definitions_from_open_documents(state, "", workspace_folder_uri);
     for document in state.documents.values() {
         if is_style_document_uri(document.uri.as_str()) {
             continue;
@@ -1888,19 +2081,43 @@ fn selector_reference_locations_by_name_from_open_documents(
             if !source_candidate_matches_target_style(&candidate, target_style_uri) {
                 continue;
             }
-            locations_by_name
-                .entry(candidate.name)
-                .or_default()
-                .push(json!({
-                    "uri": document.uri.as_str(),
-                    "range": candidate.range,
-                }));
+            for selector_name in source_candidate_selector_names(
+                &candidate,
+                definitions.as_slice(),
+                target_style_uri,
+            ) {
+                locations_by_name
+                    .entry(selector_name)
+                    .or_default()
+                    .push(json!({
+                        "uri": document.uri.as_str(),
+                        "range": candidate.range,
+                    }));
+            }
         }
     }
     for locations in locations_by_name.values_mut() {
         locations.sort_by_key(location_sort_key);
+        locations
+            .dedup_by(|left, right| location_identity_key(left) == location_identity_key(right));
     }
     locations_by_name
+}
+
+fn source_candidate_selector_names(
+    candidate: &LspStyleHoverCandidate,
+    definitions: &[(String, LspStyleHoverCandidate)],
+    target_style_uri: Option<&str>,
+) -> Vec<String> {
+    let query_definitions = definitions
+        .iter()
+        .map(|(uri, definition)| query_style_selector_definition(uri, definition))
+        .collect::<Vec<_>>();
+    resolve_omena_query_source_candidate_selector_names(
+        &query_source_selector_candidate_from_lsp(candidate),
+        query_definitions.as_slice(),
+        target_style_uri,
+    )
 }
 
 fn source_candidate_matches_target_style(
@@ -1913,6 +2130,251 @@ fn source_candidate_matches_target_style(
             .as_deref()
             .is_none_or(|candidate_target_uri| candidate_target_uri == target_uri)
     })
+}
+
+fn sass_symbol_definitions_for_candidate(
+    state: &LspShellState,
+    document: &LspTextDocumentState,
+    candidate: &LspStyleHoverCandidate,
+) -> Vec<(String, LspStyleHoverCandidate)> {
+    let Some(symbol_kind) = sass_symbol_kind_from_candidate_kind(candidate.kind) else {
+        return Vec::new();
+    };
+    if is_sass_symbol_declaration_kind(candidate.kind) {
+        return vec![(document.uri.clone(), candidate.clone())];
+    }
+
+    let mut definitions = if candidate.namespace.is_none() {
+        sass_symbol_declarations_in_document(document, symbol_kind, candidate)
+    } else {
+        Vec::new()
+    };
+    if candidate.namespace.is_none() && !definitions.is_empty() {
+        return definitions;
+    }
+
+    for target_uri in sass_module_target_uris_for_candidate(state, document, candidate) {
+        definitions.extend(sass_symbol_declarations_for_uri(
+            state,
+            target_uri.as_str(),
+            symbol_kind,
+            candidate,
+        ));
+    }
+    definitions.sort_by_key(|(uri, target)| {
+        (
+            uri.clone(),
+            target.range.start.line,
+            target.range.start.character,
+        )
+    });
+    definitions.dedup_by(|left, right| {
+        left.0 == right.0
+            && left.1.kind == right.1.kind
+            && left.1.name == right.1.name
+            && left.1.range == right.1.range
+    });
+    definitions
+}
+
+fn sass_symbol_declarations_for_uri(
+    state: &LspShellState,
+    target_uri: &str,
+    symbol_kind: &str,
+    candidate: &LspStyleHoverCandidate,
+) -> Vec<(String, LspStyleHoverCandidate)> {
+    if let Some(target_document) = state.document(target_uri) {
+        return sass_symbol_declarations_with_forwards(
+            state,
+            target_document,
+            symbol_kind,
+            candidate,
+            &mut BTreeSet::new(),
+        );
+    }
+    let Some((_, candidates)) = style_hover_candidates_for_uri(state, target_uri) else {
+        return Vec::new();
+    };
+    let query_candidates = candidates
+        .iter()
+        .map(query_style_hover_candidate_from_lsp)
+        .collect::<Vec<_>>();
+    resolve_omena_query_sass_symbol_declarations(
+        query_candidates.as_slice(),
+        symbol_kind,
+        candidate.name.as_str(),
+    )
+    .into_iter()
+    .map(lsp_style_hover_candidate_from_query)
+    .map(|target| (target_uri.to_string(), target))
+    .collect()
+}
+
+fn sass_symbol_declarations_in_document(
+    document: &LspTextDocumentState,
+    symbol_kind: &str,
+    candidate: &LspStyleHoverCandidate,
+) -> Vec<(String, LspStyleHoverCandidate)> {
+    let query_candidates = document
+        .style_candidates
+        .iter()
+        .map(query_style_hover_candidate_from_lsp)
+        .collect::<Vec<_>>();
+    resolve_omena_query_sass_symbol_declarations(
+        query_candidates.as_slice(),
+        symbol_kind,
+        candidate.name.as_str(),
+    )
+    .into_iter()
+    .map(lsp_style_hover_candidate_from_query)
+    .map(|target| (document.uri.clone(), target))
+    .collect()
+}
+
+fn sass_module_target_uris_for_candidate(
+    state: &LspShellState,
+    document: &LspTextDocumentState,
+    candidate: &LspStyleHoverCandidate,
+) -> Vec<String> {
+    let Some(sources) =
+        summarize_omena_query_sass_module_sources(document.uri.as_str(), document.text.as_str())
+    else {
+        return Vec::new();
+    };
+    let mut uris = Vec::new();
+    for source in resolve_omena_query_sass_module_use_sources_for_candidate(
+        &sources,
+        candidate.namespace.as_deref(),
+    ) {
+        if let Some(uri) = resolve_omena_bridge_style_uri_for_specifier(
+            document.uri.as_str(),
+            document.workspace_folder_uri.as_deref(),
+            source.as_str(),
+        ) {
+            uris.push(uri);
+        }
+    }
+    for forward_source in resolve_omena_query_sass_forward_sources(&sources) {
+        if let Some(uri) = resolve_omena_bridge_style_uri_for_specifier(
+            document.uri.as_str(),
+            document.workspace_folder_uri.as_deref(),
+            forward_source.as_str(),
+        ) {
+            uris.push(uri.clone());
+            if let Some(target_document) = state.document(uri.as_str()) {
+                uris.extend(sass_forward_module_target_uris(
+                    target_document,
+                    &mut BTreeSet::new(),
+                ));
+            }
+        }
+    }
+    uris.sort();
+    uris.dedup();
+    uris
+}
+
+fn sass_symbol_declarations_with_forwards(
+    state: &LspShellState,
+    document: &LspTextDocumentState,
+    symbol_kind: &str,
+    candidate: &LspStyleHoverCandidate,
+    visited: &mut BTreeSet<String>,
+) -> Vec<(String, LspStyleHoverCandidate)> {
+    if !visited.insert(document.uri.clone()) {
+        return Vec::new();
+    }
+    let mut definitions = sass_symbol_declarations_in_document(document, symbol_kind, candidate);
+    let Some(sources) =
+        summarize_omena_query_sass_module_sources(document.uri.as_str(), document.text.as_str())
+    else {
+        return definitions;
+    };
+    for forward_source in resolve_omena_query_sass_forward_sources(&sources) {
+        let Some(uri) = resolve_omena_bridge_style_uri_for_specifier(
+            document.uri.as_str(),
+            document.workspace_folder_uri.as_deref(),
+            forward_source.as_str(),
+        ) else {
+            continue;
+        };
+        let Some(target_document) = state.document(uri.as_str()) else {
+            continue;
+        };
+        definitions.extend(sass_symbol_declarations_with_forwards(
+            state,
+            target_document,
+            symbol_kind,
+            candidate,
+            visited,
+        ));
+    }
+    definitions
+}
+
+fn sass_forward_module_target_uris(
+    document: &LspTextDocumentState,
+    visited: &mut BTreeSet<String>,
+) -> Vec<String> {
+    if !visited.insert(document.uri.clone()) {
+        return Vec::new();
+    }
+    let Some(sources) =
+        summarize_omena_query_sass_module_sources(document.uri.as_str(), document.text.as_str())
+    else {
+        return Vec::new();
+    };
+    let mut uris = Vec::new();
+    for forward_source in resolve_omena_query_sass_forward_sources(&sources) {
+        if let Some(uri) = resolve_omena_bridge_style_uri_for_specifier(
+            document.uri.as_str(),
+            document.workspace_folder_uri.as_deref(),
+            forward_source.as_str(),
+        ) {
+            uris.push(uri.clone());
+        }
+    }
+    uris.sort();
+    uris.dedup();
+    uris
+}
+
+fn sass_symbol_reference_matches(
+    candidate: &LspStyleHoverCandidate,
+    target: &LspStyleHoverCandidate,
+) -> bool {
+    is_sass_symbol_reference_kind(target.kind) && sass_symbol_target_matches(candidate, target)
+}
+
+fn sass_symbol_target_matches(
+    candidate: &LspStyleHoverCandidate,
+    target: &LspStyleHoverCandidate,
+) -> bool {
+    omena_query_sass_symbol_target_matches(
+        candidate.kind,
+        candidate.name.as_str(),
+        candidate.namespace.as_deref(),
+        target.kind,
+        target.name.as_str(),
+        target.namespace.as_deref(),
+    )
+}
+
+fn render_sass_symbol_label(candidate: &LspStyleHoverCandidate) -> String {
+    let namespace_prefix = candidate
+        .namespace
+        .as_deref()
+        .map(|namespace| format!("{namespace}."))
+        .unwrap_or_default();
+    match sass_symbol_kind_from_candidate_kind(candidate.kind) {
+        Some("variable") => format!("{namespace_prefix}${}", candidate.name),
+        Some("mixin") if is_sass_symbol_declaration_kind(candidate.kind) => {
+            format!("@mixin {}", candidate.name)
+        }
+        Some("mixin") => format!("@include {namespace_prefix}{}", candidate.name),
+        Some("function") => format!("{namespace_prefix}{}()", candidate.name),
+        _ => candidate.name.clone(),
+    }
 }
 
 fn reference_lens_title(count: usize) -> String {
@@ -2044,6 +2506,9 @@ fn rename_target_matches(
         "customPropertyReference" | "customPropertyDeclaration" => {
             target.name == candidate.name && target.kind.starts_with("customProperty")
         }
+        kind if is_sass_symbol_candidate_kind(kind) => {
+            sass_symbol_target_matches(candidate, target)
+        }
         _ => false,
     }
 }
@@ -2060,11 +2525,37 @@ fn resolve_lsp_hover(state: &LspShellState, params: Option<&Value>) -> Value {
     let Some(candidate) = candidates.candidates.first() else {
         return Value::Null;
     };
+    let Some(document) = state.document(document_uri.as_str()) else {
+        return Value::Null;
+    };
+    if is_sass_symbol_reference_kind(candidate.kind)
+        && let Some((target_uri, target)) =
+            sass_symbol_definitions_for_candidate(state, document, candidate)
+                .into_iter()
+                .next()
+        && let Some(target_text) = style_text_for_uri(state, target_uri.as_str())
+    {
+        return json!({
+            "contents": {
+                "kind": "markdown",
+                "value": render_style_hover_candidate_markdown(
+                    target_uri.as_str(),
+                    target_text.as_str(),
+                    &target,
+                ),
+            },
+            "range": candidate.range,
+        });
+    }
 
     json!({
         "contents": {
             "kind": "markdown",
-            "value": render_style_hover_candidate_markdown(candidate),
+            "value": render_style_hover_candidate_markdown(
+                document.uri.as_str(),
+                document.text.as_str(),
+                candidate,
+            ),
         },
         "range": candidate.range,
     })
@@ -2078,29 +2569,22 @@ fn resolve_source_lsp_hover(
     let Some(position) = lsp_position_from_params(params) else {
         return Value::Null;
     };
-    let Some(candidate) = source_selector_candidate_at_position(state, document, position) else {
+    let candidates = source_selector_candidates_at_position(state, document, position);
+    let Some(candidate) = candidates.first() else {
         return Value::Null;
     };
-    let definition = style_selector_definitions_for_source_candidate(
+    let definitions = style_selector_definitions_for_source_candidates(
         state,
-        &candidate,
+        candidates.as_slice(),
         document.workspace_folder_uri.as_deref(),
-    )
-    .into_iter()
-    .next();
-    let definition_label = definition
-        .as_ref()
-        .map(|(uri, _)| format!("\n\nDefined in `{}`.", file_label_from_uri(uri)))
-        .unwrap_or_default();
+    );
+    let value = render_source_hover_definitions_markdown(state, definitions.as_slice())
+        .unwrap_or_else(|| format!("**`.{}`**", candidate.name));
 
     json!({
         "contents": {
             "kind": "markdown",
-            "value": format!(
-                "### .{}\n\nCSS Module selector reference from the Rust opened source document index.{}",
-                candidate.name,
-                definition_label
-            ),
+            "value": value,
         },
         "range": candidate.range,
     })
@@ -2111,12 +2595,13 @@ fn resolve_source_lsp_definition(
     document: &LspTextDocumentState,
     position: ParserPositionV0,
 ) -> Value {
-    let Some(candidate) = source_selector_candidate_at_position(state, document, position) else {
+    let candidates = source_selector_candidates_at_position(state, document, position);
+    if candidates.is_empty() {
         return Value::Null;
     };
-    let definitions = style_selector_definitions_for_source_candidate(
+    let definitions = style_selector_definitions_for_source_candidates(
         state,
-        &candidate,
+        candidates.as_slice(),
         document.workspace_folder_uri.as_deref(),
     );
     if definitions.is_empty() {
@@ -2137,29 +2622,53 @@ fn resolve_source_lsp_references(
     position: ParserPositionV0,
     params: Option<&Value>,
 ) -> Value {
-    let Some(candidate) = source_selector_candidate_at_position(state, document, position) else {
+    let candidates = source_selector_candidates_at_position(state, document, position);
+    if candidates.is_empty() {
         return Value::Null;
     };
     let include_declaration = include_declaration_from_params(params);
     let mut locations = Vec::new();
     if include_declaration {
         locations.extend(
-            style_selector_definitions_for_source_candidate(
+            style_selector_definitions_for_source_candidates(
                 state,
-                &candidate,
+                candidates.as_slice(),
                 document.workspace_folder_uri.as_deref(),
             )
             .into_iter()
             .map(|(uri, definition)| json!({ "uri": uri, "range": definition.range })),
         );
     }
-    locations.extend(selector_reference_locations_from_open_documents(
-        state,
-        candidate.name.as_str(),
-        document.workspace_folder_uri.as_deref(),
-        candidate.target_style_uri.as_deref(),
-    ));
+    for candidate in candidates {
+        if candidate.kind == "sourceSelectorPrefixReference" {
+            let definitions = style_selector_definitions_from_open_documents(
+                state,
+                "",
+                document.workspace_folder_uri.as_deref(),
+            );
+            for selector_name in source_candidate_selector_names(
+                &candidate,
+                definitions.as_slice(),
+                candidate.target_style_uri.as_deref(),
+            ) {
+                locations.extend(selector_reference_locations_from_open_documents(
+                    state,
+                    selector_name.as_str(),
+                    document.workspace_folder_uri.as_deref(),
+                    candidate.target_style_uri.as_deref(),
+                ));
+            }
+        } else {
+            locations.extend(selector_reference_locations_from_open_documents(
+                state,
+                candidate.name.as_str(),
+                document.workspace_folder_uri.as_deref(),
+                candidate.target_style_uri.as_deref(),
+            ));
+        }
+    }
     locations.sort_by_key(location_sort_key);
+    locations.dedup();
 
     if locations.is_empty() {
         Value::Null
@@ -2176,7 +2685,8 @@ fn resolve_source_lsp_completion(
     let Some(position) = lsp_position_from_params(params) else {
         return Value::Null;
     };
-    let Some(target_style_uri) = source_completion_target_style_uri_at_position(document, position)
+    let Some((target_style_uri, value_prefix)) =
+        source_completion_context_at_position(document, position)
     else {
         return Value::Null;
     };
@@ -2193,6 +2703,11 @@ fn resolve_source_lsp_completion(
             .is_none_or(|target_uri| target_uri == uri)
     })
     .map(|(_, definition)| definition.name)
+    .filter(|label| {
+        value_prefix
+            .as_deref()
+            .is_none_or(|prefix| label.starts_with(prefix))
+    })
     .collect();
     let items: Vec<Value> = labels
         .into_iter()
@@ -2200,7 +2715,7 @@ fn resolve_source_lsp_completion(
             json!({
                 "label": label,
                 "kind": 10,
-                "detail": "CSS Module selector from opened style document index",
+                "detail": "CSS Module selector",
                 "data": {
                     "source": "openedStyleDocumentIndex",
                 },
@@ -2214,149 +2729,111 @@ fn resolve_source_lsp_completion(
     })
 }
 
-fn source_completion_target_style_uri_at_position(
+fn source_completion_context_at_position(
     document: &LspTextDocumentState,
     position: ParserPositionV0,
-) -> Option<Option<String>> {
-    let source = document.text.as_str();
-    let offset = byte_offset_for_parser_position(source, position)?;
-    if is_class_name_literal_completion_context(source, offset) {
-        return Some(None);
+) -> Option<(Option<String>, Option<String>)> {
+    let offset = byte_offset_for_parser_position(document.text.as_str(), position)?;
+    if let Some(access) = document
+        .source_syntax_index
+        .style_property_accesses
+        .iter()
+        .find(|access| offset >= access.byte_span.start && offset <= access.byte_span.end)
+    {
+        return Some((
+            access.target_style_uri.clone(),
+            source_completion_prefix_for_terminal_offset(
+                document.text.as_str(),
+                access.byte_span,
+                offset,
+            ),
+        ));
     }
-    if is_class_name_expression_string_completion_context(source, offset) {
-        return Some(None);
+    if let Some(reference) = document
+        .source_syntax_index
+        .selector_references
+        .iter()
+        .find(|reference| offset >= reference.byte_span.start && offset <= reference.byte_span.end)
+    {
+        return Some((
+            reference.target_style_uri.clone(),
+            source_completion_prefix_for_terminal_offset(
+                document.text.as_str(),
+                reference.byte_span,
+                offset,
+            ),
+        ));
     }
-    styles_property_access_completion_target_style_uri(document, offset)
+    if document
+        .source_syntax_index
+        .class_string_literals
+        .iter()
+        .any(|span| offset >= span.start && offset <= span.end)
+    {
+        let span = document
+            .source_syntax_index
+            .class_string_literals
+            .iter()
+            .find(|span| offset >= span.start && offset <= span.end)
+            .copied()?;
+        return Some((
+            None,
+            source_completion_class_token_prefix_from_span(document.text.as_str(), span, offset),
+        ));
+    }
+    None
 }
 
-fn is_class_name_literal_completion_context(source: &str, offset: usize) -> bool {
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find("className") {
-        let class_name_start = search_offset + relative_match;
-        let mut cursor = class_name_start + "className".len();
-        cursor = skip_ascii_whitespace(source, cursor);
-        if source.as_bytes().get(cursor) != Some(&b'=') {
-            search_offset = cursor;
-            continue;
-        }
-        cursor = skip_ascii_whitespace(source, cursor + 1);
-        let mut expression_end_for_search = None;
-        if source.as_bytes().get(cursor) == Some(&b'{') {
-            let expression_start = cursor + 1;
-            if let Some(expression_end) = jsx_expression_end(source, expression_start) {
-                expression_end_for_search = Some(expression_end);
-            }
-            cursor = skip_ascii_whitespace(source, expression_start);
-        }
-        let Some(quote) = source.as_bytes().get(cursor).copied() else {
-            break;
-        };
-        if !matches!(quote, b'\'' | b'"' | b'`') {
-            search_offset = expression_end_for_search.map_or(cursor + 1, |end| end + 1);
-            continue;
-        }
-        let literal_start = cursor + 1;
-        let Some(relative_end) = source[literal_start..].find(char::from(quote)) else {
-            break;
-        };
-        let literal_end = literal_start + relative_end;
-        if offset >= literal_start && offset <= literal_end {
-            return true;
-        }
-        search_offset = literal_end + 1;
-    }
-    false
-}
-
-fn is_class_name_expression_string_completion_context(source: &str, offset: usize) -> bool {
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find("className") {
-        let class_name_start = search_offset + relative_match;
-        let mut cursor = class_name_start + "className".len();
-        cursor = skip_ascii_whitespace(source, cursor);
-        if source.as_bytes().get(cursor) != Some(&b'=') {
-            search_offset = cursor;
-            continue;
-        }
-        cursor = skip_ascii_whitespace(source, cursor + 1);
-        if source.as_bytes().get(cursor) != Some(&b'{') {
-            search_offset = cursor + 1;
-            continue;
-        }
-        let expression_start = cursor + 1;
-        let Some(expression_end) = jsx_expression_end(source, expression_start) else {
-            break;
-        };
-        if offset_in_js_string_literal(source, expression_start, expression_end, offset) {
-            return true;
-        }
-        search_offset = expression_end + 1;
-    }
-    false
-}
-
-fn styles_property_access_completion_target_style_uri(
-    document: &LspTextDocumentState,
-    offset: usize,
-) -> Option<Option<String>> {
-    let bindings = imported_style_bindings(document);
-    if bindings.is_empty() {
-        return is_styles_property_access_completion_context_for_binding(
-            document.text.as_str(),
-            "styles",
-            offset,
-        )
-        .then_some(None);
-    }
-
-    bindings.into_iter().find_map(|binding| {
-        is_styles_property_access_completion_context_for_binding(
-            document.text.as_str(),
-            binding.binding.as_str(),
-            offset,
-        )
-        .then_some(Some(binding.style_uri))
-    })
-}
-
-fn is_styles_property_access_completion_context_for_binding(
+fn source_completion_prefix_for_terminal_offset(
     source: &str,
-    binding: &str,
+    span: ParserByteSpanV0,
     offset: usize,
-) -> bool {
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find(binding) {
-        let binding_start = search_offset + relative_match;
-        let binding_end = binding_start + binding.len();
-        if !is_js_identifier_boundary(source, binding_start, binding_end) {
-            search_offset = binding_end;
-            continue;
-        }
+) -> Option<String> {
+    (offset >= span.end).then(|| source_completion_prefix_from_span(source, span, offset))?
+}
 
-        let cursor = skip_ascii_whitespace(source, binding_end);
-        if source.as_bytes().get(cursor) == Some(&b'.') {
-            let start = cursor + 1;
-            let end = read_css_identifier_end(source, start);
-            if offset >= start && offset <= end {
-                return true;
-            }
-            search_offset = end.max(binding_end);
-            continue;
-        }
-        if source.as_bytes().get(cursor) == Some(&b'[')
-            && let Some((literal_start, literal_end, bracket_end)) =
-                bracket_string_literal_access(source, cursor)
-        {
-            if offset >= literal_start && offset <= literal_end {
-                return true;
-            }
-            search_offset = bracket_end;
-            continue;
-        }
-
-        search_offset = binding_end;
+fn source_completion_prefix_from_span(
+    source: &str,
+    span: ParserByteSpanV0,
+    offset: usize,
+) -> Option<String> {
+    let end = offset.min(span.end);
+    if end < span.start {
+        return None;
     }
-    false
+    let prefix = source.get(span.start..end)?;
+    if prefix.is_empty() {
+        return None;
+    }
+    if prefix.chars().all(is_css_identifier_continue) {
+        Some(prefix.to_string())
+    } else {
+        None
+    }
+}
+
+fn source_completion_class_token_prefix_from_span(
+    source: &str,
+    span: ParserByteSpanV0,
+    offset: usize,
+) -> Option<String> {
+    let end = offset.min(span.end);
+    if end < span.start {
+        return None;
+    }
+    let prefix = source.get(span.start..end)?;
+    let token = prefix
+        .rsplit(|ch: char| ch.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    if token.is_empty() {
+        return None;
+    }
+    if token.chars().all(is_css_identifier_continue) {
+        Some(token.to_string())
+    } else {
+        None
+    }
 }
 
 fn source_selector_candidate_for_params(
@@ -2378,9 +2855,20 @@ fn source_selector_candidate_at_position(
     document: &LspTextDocumentState,
     position: ParserPositionV0,
 ) -> Option<LspStyleHoverCandidate> {
+    source_selector_candidates_at_position(state, document, position)
+        .into_iter()
+        .next()
+}
+
+fn source_selector_candidates_at_position(
+    state: &LspShellState,
+    document: &LspTextDocumentState,
+    position: ParserPositionV0,
+) -> Vec<LspStyleHoverCandidate> {
     collect_source_selector_reference_candidates(state, document)
         .into_iter()
-        .find(|candidate| parser_range_contains_position(&candidate.range, position))
+        .filter(|candidate| parser_range_contains_position(&candidate.range, position))
+        .collect()
 }
 
 fn collect_source_selector_reference_candidates(
@@ -2394,46 +2882,43 @@ fn resolve_source_provider_candidates(
     state: &LspShellState,
     document: &LspTextDocumentState,
 ) -> SourceProviderCandidateResolution {
-    let definitions = style_selector_definitions_from_open_documents(
+    let source_candidates = collect_source_class_reference_candidates(document);
+    let mut definitions = style_selector_definitions_from_open_documents(
         state,
         "",
         document.workspace_folder_uri.as_deref(),
     );
-    let selector_names: BTreeSet<String> = definitions
+    for candidate in &source_candidates {
+        if let Some(target_uri) = candidate.target_style_uri.as_deref()
+            && !definitions.iter().any(|(uri, _)| uri == target_uri)
+        {
+            definitions.extend(style_selector_definitions_from_uri(state, target_uri));
+        }
+    }
+    let query_definitions = definitions
         .iter()
-        .map(|(_, definition)| definition.name.clone())
-        .collect();
-    if selector_names.is_empty() {
-        return SourceProviderCandidateResolution {
-            matched: Vec::new(),
-            unresolved: Vec::new(),
-        };
-    }
-    let (mut matched, mut unresolved): (Vec<_>, Vec<_>) =
-        collect_source_class_reference_candidates(document)
-            .into_iter()
-            .partition(|candidate| {
-                source_candidate_has_style_definition(candidate, definitions.as_slice())
-            });
-    matched.sort();
-    unresolved.sort();
-    SourceProviderCandidateResolution {
-        matched,
-        unresolved,
-    }
-}
+        .map(|(uri, definition)| query_style_selector_definition(uri, definition))
+        .collect::<Vec<_>>();
+    let resolution = resolve_omena_query_source_provider_candidates(
+        source_candidates
+            .iter()
+            .map(query_source_selector_candidate_from_lsp)
+            .collect(),
+        query_definitions.as_slice(),
+    );
 
-fn source_candidate_has_style_definition(
-    candidate: &LspStyleHoverCandidate,
-    definitions: &[(String, LspStyleHoverCandidate)],
-) -> bool {
-    definitions.iter().any(|(uri, definition)| {
-        definition.name == candidate.name
-            && candidate
-                .target_style_uri
-                .as_deref()
-                .is_none_or(|target_uri| target_uri == uri)
-    })
+    SourceProviderCandidateResolution {
+        matched: resolution
+            .matched
+            .into_iter()
+            .map(lsp_source_selector_candidate_from_query)
+            .collect(),
+        unresolved: resolution
+            .unresolved
+            .into_iter()
+            .map(lsp_source_selector_candidate_from_query)
+            .collect(),
+    }
 }
 
 fn collect_source_class_reference_candidates(
@@ -2442,594 +2927,91 @@ fn collect_source_class_reference_candidates(
     document.source_selector_candidates.clone()
 }
 
-fn scan_source_class_reference_candidates(
+fn source_selector_candidates_from_index(
     document: &LspTextDocumentState,
+    index: &SourceSyntaxIndex,
 ) -> Vec<LspStyleHoverCandidate> {
-    let mut candidates = Vec::new();
-    collect_class_name_attribute_candidates(document, &mut candidates);
-    collect_styles_property_access_candidates(document, &mut candidates);
-    collect_classnames_bind_call_candidates(document, &mut candidates);
+    let mut candidates: Vec<LspStyleHoverCandidate> = index
+        .selector_references
+        .iter()
+        .map(|reference| source_reference_candidate(document, reference))
+        .collect();
     candidates.sort();
     candidates.dedup();
     candidates
 }
 
-fn collect_class_name_attribute_candidates(
-    document: &LspTextDocumentState,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
+fn build_source_syntax_index(document: &LspTextDocumentState) -> SourceSyntaxIndex {
+    if is_style_document_uri(document.uri.as_str()) {
+        return SourceSyntaxIndex::default();
+    }
+
+    let imports = collect_source_imports(document);
+    summarize_omena_bridge_source_syntax_index(
+        document.text.as_str(),
+        imports.imported_style_bindings,
+        imports.classnames_bind_bindings,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceImportIndex {
+    imported_style_bindings: Vec<ImportedStyleBinding>,
+    classnames_bind_bindings: Vec<String>,
+}
+
+fn collect_source_imports(document: &LspTextDocumentState) -> SourceImportIndex {
     let source = document.text.as_str();
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find("className") {
-        let class_name_start = search_offset + relative_match;
-        let mut cursor = class_name_start + "className".len();
-        cursor = skip_ascii_whitespace(source, cursor);
-        if source.as_bytes().get(cursor) != Some(&b'=') {
-            search_offset = cursor;
-            continue;
-        }
-        cursor = skip_ascii_whitespace(source, cursor + 1);
-        let mut expression_end_for_search = None;
-        if source.as_bytes().get(cursor) == Some(&b'{') {
-            let expression_start = cursor + 1;
-            if let Some(expression_end) = jsx_expression_end(source, expression_start) {
-                collect_class_name_expression_string_candidates(
-                    document,
-                    expression_start,
-                    expression_end,
-                    candidates,
-                );
-                expression_end_for_search = Some(expression_end);
-            }
-            cursor = skip_ascii_whitespace(source, expression_start);
-        }
-        let Some(quote) = source.as_bytes().get(cursor).copied() else {
-            break;
-        };
-        if !matches!(quote, b'\'' | b'"' | b'`') {
-            search_offset = expression_end_for_search.map_or(cursor + 1, |end| end + 1);
-            continue;
-        }
-        let literal_start = cursor + 1;
-        let Some(relative_end) = source[literal_start..].find(char::from(quote)) else {
-            break;
-        };
-        let literal_end = literal_start + relative_end;
-        for span in class_token_byte_spans(source, literal_start, literal_end) {
-            candidates.push(source_reference_candidate(document, span, None));
-        }
-        search_offset = literal_end + 1;
-    }
-}
-
-fn collect_class_name_expression_string_candidates(
-    document: &LspTextDocumentState,
-    expression_start: usize,
-    expression_end: usize,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    let source = document.text.as_str();
-    let mut cursor = expression_start;
-    while cursor < expression_end {
-        let Some(quote) = source.as_bytes().get(cursor).copied() else {
-            break;
-        };
-        if !matches!(quote, b'\'' | b'"') {
-            cursor += 1;
-            continue;
-        }
-        if let Some((literal_start, literal_end, next_offset)) =
-            js_string_literal_span(source, cursor, expression_end)
-        {
-            for span in class_token_byte_spans(source, literal_start, literal_end) {
-                candidates.push(source_reference_candidate(document, span, None));
-            }
-            cursor = next_offset;
-            continue;
-        }
-        cursor += 1;
-    }
-}
-
-fn collect_styles_property_access_candidates(
-    document: &LspTextDocumentState,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    let bindings = imported_style_bindings(document);
-    if bindings.is_empty() {
-        collect_styles_property_access_candidates_for_binding(document, "styles", None, candidates);
-        return;
-    }
-
-    for binding in bindings {
-        collect_styles_property_access_candidates_for_binding(
-            document,
-            binding.binding.as_str(),
-            Some(binding.style_uri.as_str()),
-            candidates,
-        );
-    }
-}
-
-fn collect_styles_property_access_candidates_for_binding(
-    document: &LspTextDocumentState,
-    binding: &str,
-    target_style_uri: Option<&str>,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    let source = document.text.as_str();
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find(binding) {
-        let binding_start = search_offset + relative_match;
-        let binding_end = binding_start + binding.len();
-        if !is_js_identifier_boundary(source, binding_start, binding_end) {
-            search_offset = binding_end;
-            continue;
-        }
-
-        let cursor = skip_ascii_whitespace(source, binding_end);
-        if source.as_bytes().get(cursor) == Some(&b'.') {
-            let start = cursor + 1;
-            let end = read_css_identifier_end(source, start);
-            if end > start {
-                candidates.push(source_reference_candidate(
-                    document,
-                    ParserByteSpanV0 { start, end },
-                    target_style_uri.map(ToString::to_string),
-                ));
-            }
-            search_offset = end.max(binding_end);
-            continue;
-        }
-        if source.as_bytes().get(cursor) == Some(&b'[')
-            && let Some((literal_start, literal_end, bracket_end)) =
-                bracket_string_literal_access(source, cursor)
-        {
-            if literal_end > literal_start
-                && source[literal_start..literal_end]
-                    .chars()
-                    .all(is_css_identifier_continue)
-            {
-                candidates.push(source_reference_candidate(
-                    document,
-                    ParserByteSpanV0 {
-                        start: literal_start,
-                        end: literal_end,
-                    },
-                    target_style_uri.map(ToString::to_string),
-                ));
-            }
-            search_offset = bracket_end;
-            continue;
-        }
-
-        search_offset = binding_end;
-    }
-}
-
-struct ClassnamesBindUtilityBinding {
-    binding: String,
-    style_uri: String,
-}
-
-fn collect_classnames_bind_call_candidates(
-    document: &LspTextDocumentState,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    for binding in classnames_bind_utility_bindings(document) {
-        collect_string_literal_call_candidates_for_binding(
-            document,
-            binding.binding.as_str(),
-            Some(binding.style_uri.as_str()),
-            candidates,
-        );
-    }
-}
-
-fn classnames_bind_utility_bindings(
-    document: &LspTextDocumentState,
-) -> Vec<ClassnamesBindUtilityBinding> {
-    let source = document.text.as_str();
-    if !source.contains("classnames/bind") {
-        return Vec::new();
-    }
-
-    let style_bindings = imported_style_bindings(document);
-    if style_bindings.is_empty() {
-        return Vec::new();
-    }
-
-    let mut bindings = Vec::new();
-    for keyword in ["const ", "let ", "var "] {
-        let mut search_offset = 0usize;
-        while let Some(relative_match) = source[search_offset..].find(keyword) {
-            let statement_start = search_offset + relative_match;
-            let statement_end = source[statement_start..]
-                .find(';')
-                .map(|relative_end| statement_start + relative_end)
-                .unwrap_or_else(|| source.len());
-            if let Some(binding) = classnames_bind_utility_binding_from_statement(
-                &source[statement_start..statement_end],
-                &style_bindings,
-            ) {
-                bindings.push(binding);
-            }
-            search_offset = statement_end.saturating_add(1);
-        }
-    }
-    bindings.sort_by(|left, right| {
-        left.binding
-            .cmp(&right.binding)
-            .then_with(|| left.style_uri.cmp(&right.style_uri))
-    });
-    bindings
-        .dedup_by(|left, right| left.binding == right.binding && left.style_uri == right.style_uri);
-    bindings
-}
-
-fn classnames_bind_utility_binding_from_statement(
-    statement: &str,
-    style_bindings: &[ImportedStyleBinding],
-) -> Option<ClassnamesBindUtilityBinding> {
-    let keyword_len = ["const ", "let ", "var "]
-        .into_iter()
-        .find_map(|keyword| statement.strip_prefix(keyword).map(|_| keyword.len()))?;
-    let binding_start = skip_ascii_whitespace(statement, keyword_len);
-    let (binding, binding_end) = read_js_identifier(statement, binding_start)?;
-    let equals_offset = skip_ascii_whitespace(statement, binding_end);
-    if statement.as_bytes().get(equals_offset) != Some(&b'=') {
-        return None;
-    }
-    let initializer = &statement[equals_offset + 1..];
-    let bind_offset = initializer.find(".bind")?;
-    let open_paren = skip_ascii_whitespace(initializer, bind_offset + ".bind".len());
-    if initializer.as_bytes().get(open_paren) != Some(&b'(') {
-        return None;
-    }
-    let style_arg_start = skip_ascii_whitespace(initializer, open_paren + 1);
-    let (style_binding_name, _) = read_js_identifier(initializer, style_arg_start)?;
-    let style_uri = style_bindings
-        .iter()
-        .find(|style_binding| style_binding.binding == style_binding_name)?
-        .style_uri
-        .clone();
-
-    Some(ClassnamesBindUtilityBinding {
-        binding: binding.to_string(),
-        style_uri,
-    })
-}
-
-fn collect_string_literal_call_candidates_for_binding(
-    document: &LspTextDocumentState,
-    binding: &str,
-    target_style_uri: Option<&str>,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    let source = document.text.as_str();
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find(binding) {
-        let binding_start = search_offset + relative_match;
-        let binding_end = binding_start + binding.len();
-        if !is_js_identifier_boundary(source, binding_start, binding_end) {
-            search_offset = binding_end;
-            continue;
-        }
-
-        let open_paren = skip_ascii_whitespace(source, binding_end);
-        if source.as_bytes().get(open_paren) != Some(&b'(') {
-            search_offset = binding_end;
-            continue;
-        }
-        let call_end = js_call_end(source, open_paren).unwrap_or(source.len());
-        let mut cursor = open_paren + 1;
-        while cursor < call_end {
-            if let Some((literal_start, literal_end, next_offset)) =
-                js_string_literal_span(source, cursor, call_end)
-            {
-                for span in class_token_byte_spans(source, literal_start, literal_end) {
-                    candidates.push(source_reference_candidate(
-                        document,
-                        span,
-                        target_style_uri.map(ToString::to_string),
-                    ));
-                }
-                cursor = next_offset;
-                continue;
-            }
-            cursor += 1;
-        }
-        search_offset = call_end.saturating_add(1);
-    }
-}
-
-fn js_call_end(source: &str, open_paren: usize) -> Option<usize> {
-    if source.as_bytes().get(open_paren) != Some(&b'(') {
-        return None;
-    }
-    let mut cursor = open_paren + 1;
-    let mut depth = 1usize;
-    while cursor < source.len() {
-        match source.as_bytes().get(cursor).copied()? {
-            b'\'' | b'"' | b'`' => {
-                cursor = skip_js_string_literal(source, cursor, source.len())?;
-            }
-            b'(' => {
-                depth += 1;
-                cursor += 1;
-            }
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(cursor);
-                }
-                cursor += 1;
-            }
-            _ => {
-                cursor += 1;
-            }
-        }
-    }
-    None
-}
-
-struct ImportedStyleBinding {
-    binding: String,
-    style_uri: String,
-}
-
-fn imported_style_bindings(document: &LspTextDocumentState) -> Vec<ImportedStyleBinding> {
-    let source = document.text.as_str();
-    let mut bindings = Vec::new();
-    let mut search_offset = 0usize;
-    while let Some(relative_match) = source[search_offset..].find("import ") {
-        let import_start = search_offset + relative_match;
-        let statement_end = source[import_start..]
-            .find(';')
-            .map(|relative_end| import_start + relative_end)
-            .unwrap_or_else(|| source.len());
-        let statement = &source[import_start..statement_end];
-        if let Some(binding) = imported_style_binding_from_statement(document, statement) {
-            bindings.push(binding);
-        }
-        search_offset = statement_end.saturating_add(1);
-    }
-    bindings.sort_by(|left, right| left.binding.cmp(&right.binding));
-    bindings
-        .dedup_by(|left, right| left.binding == right.binding && left.style_uri == right.style_uri);
-    bindings
-}
-
-fn imported_style_binding_from_statement(
-    document: &LspTextDocumentState,
-    statement: &str,
-) -> Option<ImportedStyleBinding> {
-    let from_index = statement.find(" from ")?;
-    let binding_part = statement.get("import ".len()..from_index)?.trim();
-    let specifier_part = statement.get(from_index + " from ".len()..)?.trim();
-    let specifier = quoted_prefix(specifier_part)?;
-    StyleLanguage::from_module_path(specifier)?;
-    let style_uri = style_uri_for_import_specifier(document.uri.as_str(), specifier)?;
-    let binding = if let Some(namespace_binding) = binding_part.strip_prefix("* as ") {
-        namespace_binding.trim()
-    } else {
-        binding_part.split(',').next().unwrap_or_default().trim()
+    let mut imports = SourceImportIndex {
+        imported_style_bindings: Vec::new(),
+        classnames_bind_bindings: Vec::new(),
     };
-    if binding.is_empty() || binding.starts_with('{') {
-        return None;
+    let summary = omena_bridge::summarize_omena_bridge_source_import_declarations(source);
+    for import in summary.imports {
+        if import.specifier == "classnames/bind" {
+            imports.classnames_bind_bindings.push(import.binding);
+        } else if StyleLanguage::from_module_path(import.specifier.as_str()).is_some()
+            && let Some(style_uri) = resolve_omena_bridge_style_uri_for_specifier(
+                document.uri.as_str(),
+                document.workspace_folder_uri.as_deref(),
+                import.specifier.as_str(),
+            )
+        {
+            imports.imported_style_bindings.push(ImportedStyleBinding {
+                binding: import.binding,
+                style_uri,
+            });
+        }
     }
-    Some(ImportedStyleBinding {
-        binding: binding.to_string(),
-        style_uri,
-    })
-}
-
-fn quoted_prefix(source: &str) -> Option<&str> {
-    let quote = source.as_bytes().first().copied()?;
-    if !matches!(quote, b'\'' | b'"') {
-        return None;
-    }
-    let end = source[1..].find(char::from(quote))? + 1;
-    source.get(1..end)
-}
-
-fn style_uri_for_import_specifier(source_uri: &str, specifier: &str) -> Option<String> {
-    if !specifier.starts_with('.') {
-        return None;
-    }
-    let source_path = file_uri_to_path(source_uri)?;
-    let imported_path = normalize_path(source_path.parent()?.join(specifier));
-    Some(path_to_file_uri(imported_path.as_path()))
+    imports
+        .imported_style_bindings
+        .sort_by(|left, right| left.binding.cmp(&right.binding));
+    imports
+        .imported_style_bindings
+        .dedup_by(|left, right| left.binding == right.binding && left.style_uri == right.style_uri);
+    imports.classnames_bind_bindings.sort();
+    imports.classnames_bind_bindings.dedup();
+    imports
 }
 
 fn source_reference_candidate(
     document: &LspTextDocumentState,
-    byte_span: ParserByteSpanV0,
-    target_style_uri: Option<String>,
+    reference: &SourceSelectorReferenceFact,
 ) -> LspStyleHoverCandidate {
+    let name = reference.selector_name.clone().unwrap_or_else(|| {
+        document.text[reference.byte_span.start..reference.byte_span.end].to_string()
+    });
     LspStyleHoverCandidate {
-        kind: "sourceSelectorReference",
-        name: document.text[byte_span.start..byte_span.end].to_string(),
-        range: parser_range_for_byte_span(document.text.as_str(), byte_span),
-        source: "openedSourceDocumentIndex",
-        target_style_uri,
+        kind: match reference.match_kind {
+            SourceSelectorReferenceMatchKind::Exact => "sourceSelectorReference",
+            SourceSelectorReferenceMatchKind::Prefix => "sourceSelectorPrefixReference",
+        },
+        name,
+        range: parser_range_for_byte_span(document.text.as_str(), reference.byte_span),
+        source: "omenaBridgeSourceSyntaxIndex",
+        target_style_uri: reference.target_style_uri.clone(),
+        namespace: None,
     }
-}
-
-fn class_token_byte_spans(
-    source: &str,
-    literal_start: usize,
-    literal_end: usize,
-) -> Vec<ParserByteSpanV0> {
-    let mut spans = Vec::new();
-    let mut token_start: Option<usize> = None;
-    for (relative_index, ch) in source[literal_start..literal_end].char_indices() {
-        let index = literal_start + relative_index;
-        if ch.is_ascii_whitespace() {
-            if let Some(start) = token_start.take() {
-                push_class_token_span(source, start, index, &mut spans);
-            }
-        } else if token_start.is_none() {
-            token_start = Some(index);
-        }
-    }
-    if let Some(start) = token_start {
-        push_class_token_span(source, start, literal_end, &mut spans);
-    }
-    spans
-}
-
-fn push_class_token_span(
-    source: &str,
-    start: usize,
-    end: usize,
-    spans: &mut Vec<ParserByteSpanV0>,
-) {
-    if start < end && source[start..end].chars().all(is_css_identifier_continue) {
-        spans.push(ParserByteSpanV0 { start, end });
-    }
-}
-
-fn skip_ascii_whitespace(source: &str, mut offset: usize) -> usize {
-    while source
-        .as_bytes()
-        .get(offset)
-        .is_some_and(u8::is_ascii_whitespace)
-    {
-        offset += 1;
-    }
-    offset
-}
-
-fn jsx_expression_end(source: &str, start: usize) -> Option<usize> {
-    let mut cursor = start;
-    let mut nested_braces = 0usize;
-    while cursor < source.len() {
-        match source.as_bytes().get(cursor).copied()? {
-            b'\'' | b'"' | b'`' => {
-                cursor = skip_js_string_literal(source, cursor, source.len())?;
-            }
-            b'{' => {
-                nested_braces += 1;
-                cursor += 1;
-            }
-            b'}' => {
-                if nested_braces == 0 {
-                    return Some(cursor);
-                }
-                nested_braces -= 1;
-                cursor += 1;
-            }
-            _ => {
-                cursor += 1;
-            }
-        }
-    }
-    None
-}
-
-fn js_string_literal_span(
-    source: &str,
-    quote_offset: usize,
-    limit: usize,
-) -> Option<(usize, usize, usize)> {
-    let quote = source.as_bytes().get(quote_offset).copied()?;
-    if !matches!(quote, b'\'' | b'"') {
-        return None;
-    }
-    let literal_start = quote_offset + 1;
-    let next_offset = skip_js_string_literal(source, quote_offset, limit)?;
-    Some((literal_start, next_offset - 1, next_offset))
-}
-
-fn offset_in_js_string_literal(source: &str, start: usize, end: usize, offset: usize) -> bool {
-    let mut cursor = start;
-    while cursor < end {
-        let Some(quote) = source.as_bytes().get(cursor).copied() else {
-            break;
-        };
-        if !matches!(quote, b'\'' | b'"') {
-            cursor += 1;
-            continue;
-        }
-        if let Some((literal_start, literal_end, next_offset)) =
-            js_string_literal_span(source, cursor, end)
-        {
-            if offset >= literal_start && offset <= literal_end {
-                return true;
-            }
-            cursor = next_offset;
-            continue;
-        }
-        cursor += 1;
-    }
-    false
-}
-
-fn skip_js_string_literal(source: &str, quote_offset: usize, limit: usize) -> Option<usize> {
-    let quote = source.as_bytes().get(quote_offset).copied()?;
-    let mut cursor = quote_offset + 1;
-    while cursor < limit {
-        let byte = source.as_bytes().get(cursor).copied()?;
-        if byte == b'\\' {
-            cursor = (cursor + 2).min(limit);
-            continue;
-        }
-        if byte == quote {
-            return Some(cursor + 1);
-        }
-        cursor += 1;
-    }
-    None
-}
-
-fn bracket_string_literal_access(
-    source: &str,
-    bracket_offset: usize,
-) -> Option<(usize, usize, usize)> {
-    if source.as_bytes().get(bracket_offset) != Some(&b'[') {
-        return None;
-    }
-    let quote_offset = skip_ascii_whitespace(source, bracket_offset + 1);
-    let quote = source.as_bytes().get(quote_offset).copied()?;
-    if !matches!(quote, b'\'' | b'"') {
-        return None;
-    }
-    let literal_start = quote_offset + 1;
-    let relative_end = source[literal_start..].find(char::from(quote))?;
-    let literal_end = literal_start + relative_end;
-    let closing_bracket = skip_ascii_whitespace(source, literal_end + 1);
-    if source.as_bytes().get(closing_bracket) != Some(&b']') {
-        return None;
-    }
-    Some((literal_start, literal_end, closing_bracket + 1))
-}
-
-fn read_css_identifier_end(source: &str, start: usize) -> usize {
-    let mut end = start;
-    for (relative_index, ch) in source[start..].char_indices() {
-        if !is_css_identifier_continue(ch) {
-            break;
-        }
-        end = start + relative_index + ch.len_utf8();
-    }
-    end
-}
-
-fn read_js_identifier(source: &str, start: usize) -> Option<(&str, usize)> {
-    let first = source[start..].chars().next()?;
-    if !is_js_identifier_start(first) {
-        return None;
-    }
-    let mut end = start + first.len_utf8();
-    let scan_start = end;
-    for (relative_index, ch) in source[scan_start..].char_indices() {
-        if !is_js_identifier_continue(ch) {
-            break;
-        }
-        end = scan_start + relative_index + ch.len_utf8();
-    }
-    Some((&source[start..end], end))
 }
 
 fn style_selector_definitions_from_open_documents(
@@ -3067,24 +3049,116 @@ fn style_selector_definitions_from_open_documents(
     definitions
 }
 
+fn style_selector_definitions_from_uri(
+    state: &LspShellState,
+    uri: &str,
+) -> Vec<(String, LspStyleHoverCandidate)> {
+    style_hover_candidates_for_uri(state, uri)
+        .map(|(_, candidates)| {
+            candidates
+                .into_iter()
+                .filter(|candidate| candidate.kind == "selector")
+                .map(|candidate| (uri.to_string(), candidate))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn style_selector_definitions_for_source_candidate(
     state: &LspShellState,
     candidate: &LspStyleHoverCandidate,
     workspace_folder_uri: Option<&str>,
 ) -> Vec<(String, LspStyleHoverCandidate)> {
-    style_selector_definitions_from_open_documents(
+    let mut definitions = style_selector_definitions_from_open_documents(
         state,
-        candidate.name.as_str(),
+        source_candidate_definition_lookup_name(candidate),
         workspace_folder_uri,
+    );
+    if let Some(target_uri) = candidate.target_style_uri.as_deref()
+        && !definitions.iter().any(|(uri, _)| uri == target_uri)
+    {
+        definitions.extend(style_selector_definitions_from_uri(state, target_uri));
+    }
+    let query_definitions = definitions
+        .iter()
+        .map(|(uri, definition)| query_style_selector_definition(uri, definition))
+        .collect::<Vec<_>>();
+    let matched_identities = resolve_omena_query_style_selector_definitions_for_source_candidate(
+        &query_source_selector_candidate_from_lsp(candidate),
+        query_definitions.as_slice(),
     )
     .into_iter()
-    .filter(|(uri, _)| {
-        candidate
-            .target_style_uri
-            .as_deref()
-            .is_none_or(|target_uri| target_uri == uri)
+    .map(|definition| {
+        query_definition_identity(
+            definition.uri.as_str(),
+            definition.name.as_str(),
+            definition.range,
+        )
     })
-    .collect()
+    .collect::<BTreeSet<_>>();
+
+    definitions
+        .into_iter()
+        .filter(|(uri, definition)| {
+            matched_identities.contains(&query_definition_identity(
+                uri.as_str(),
+                definition.name.as_str(),
+                definition.range,
+            ))
+        })
+        .collect()
+}
+
+fn style_selector_definitions_for_source_candidates(
+    state: &LspShellState,
+    candidates: &[LspStyleHoverCandidate],
+    workspace_folder_uri: Option<&str>,
+) -> Vec<(String, LspStyleHoverCandidate)> {
+    let mut definitions = candidates
+        .iter()
+        .flat_map(|candidate| {
+            style_selector_definitions_for_source_candidate(state, candidate, workspace_folder_uri)
+        })
+        .collect::<Vec<_>>();
+    definitions.sort_by_key(|(uri, definition)| {
+        (
+            uri.clone(),
+            definition.range.start.line,
+            definition.range.start.character,
+            definition.name.clone(),
+        )
+    });
+    definitions.dedup_by(|left, right| {
+        left.0 == right.0 && left.1.name == right.1.name && left.1.range == right.1.range
+    });
+    definitions
+}
+
+fn render_source_hover_definitions_markdown(
+    state: &LspShellState,
+    definitions: &[(String, LspStyleHoverCandidate)],
+) -> Option<String> {
+    let parts = definitions
+        .iter()
+        .filter_map(|(uri, definition)| {
+            style_text_for_uri(state, uri).map(|text| {
+                render_style_hover_candidate_markdown(uri.as_str(), text.as_str(), definition)
+            })
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n---\n\n"))
+    }
+}
+
+fn source_candidate_definition_lookup_name(candidate: &LspStyleHoverCandidate) -> &str {
+    if candidate.kind == "sourceSelectorPrefixReference" {
+        ""
+    } else {
+        candidate.name.as_str()
+    }
 }
 
 fn first_style_document_for_workspace<'a>(
@@ -3107,22 +3181,12 @@ fn resolve_selector_rename(
     selector_name: &str,
     new_name: &str,
 ) -> Value {
-    let replacement = new_name.trim_start_matches('.');
-    if replacement.is_empty() {
-        return Value::Null;
-    }
-
-    let mut changes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for (uri, definition) in
+    let query_definitions =
         style_selector_definitions_from_open_documents(state, selector_name, workspace_folder_uri)
-            .into_iter()
-            .filter(|(uri, _)| target_style_uri.is_none_or(|target_uri| target_uri == uri))
-    {
-        changes.entry(uri).or_default().push(json!({
-            "range": definition.range,
-            "newText": replacement,
-        }));
-    }
+            .iter()
+            .map(|(uri, definition)| query_style_selector_definition(uri, definition))
+            .collect::<Vec<_>>();
+    let mut query_references = Vec::new();
     for document in state.documents.values() {
         if is_style_document_uri(document.uri.as_str()) {
             continue;
@@ -3130,23 +3194,29 @@ fn resolve_selector_rename(
         if !workspace_folder_compatible(workspace_folder_uri, document) {
             continue;
         }
-        for candidate in collect_source_selector_reference_candidates(state, document)
-            .into_iter()
-            .filter(|candidate| candidate.name == selector_name)
-            .filter(|candidate| source_candidate_matches_target_style(candidate, target_style_uri))
-        {
-            changes
-                .entry(document.uri.clone())
-                .or_default()
-                .push(json!({
-                    "range": candidate.range,
-                    "newText": replacement,
-                }));
-        }
+        query_references.extend(
+            collect_source_selector_reference_candidates(state, document)
+                .iter()
+                .map(|candidate| query_source_selector_reference_edit_target(document, candidate)),
+        );
+    }
+    let edits = resolve_omena_query_selector_rename_edits(
+        selector_name,
+        new_name,
+        target_style_uri,
+        query_definitions.as_slice(),
+        query_references.as_slice(),
+    );
+    if edits.is_empty() {
+        return Value::Null;
     }
 
-    if changes.is_empty() {
-        return Value::Null;
+    let mut changes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for edit in edits {
+        changes.entry(edit.uri).or_default().push(json!({
+            "range": edit.range,
+            "newText": edit.new_text,
+        }));
     }
     for edits in changes.values_mut() {
         edits.sort_by_key(|edit| {
@@ -3179,8 +3249,20 @@ fn workspace_folder_compatible(
         workspace_folder_uri,
         document.workspace_folder_uri.as_deref(),
     ) {
-        (Some(left), Some(right)) => left == right,
+        (Some(left), Some(right)) => workspace_folder_uri_equivalent(left, right),
         _ => true,
+    }
+}
+
+fn workspace_folder_uri_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (file_uri_to_path(left), file_uri_to_path(right)) {
+        (Some(left_path), Some(right_path)) => {
+            normalize_path(left_path) == normalize_path(right_path)
+        }
+        _ => false,
     }
 }
 
@@ -3237,6 +3319,31 @@ fn location_sort_key(location: &Value) -> (String, u64, u64) {
     (uri, line, character)
 }
 
+fn location_identity_key(location: &Value) -> (String, u64, u64, u64, u64) {
+    let uri = location
+        .get("uri")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let start_line = location
+        .pointer("/range/start/line")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let start_character = location
+        .pointer("/range/start/character")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let end_line = location
+        .pointer("/range/end/line")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let end_character = location
+        .pointer("/range/end/character")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    (uri, start_line, start_character, end_line, end_character)
+}
+
 fn lsp_range_start_sort_key(value: &Value) -> (u64, u64) {
     let line = value
         .pointer("/range/start/line")
@@ -3249,21 +3356,80 @@ fn lsp_range_start_sort_key(value: &Value) -> (u64, u64) {
     (line, character)
 }
 
-fn render_style_hover_candidate_markdown(candidate: &LspStyleHoverCandidate) -> String {
+fn render_style_hover_candidate_markdown(
+    document_uri: &str,
+    source: &str,
+    candidate: &LspStyleHoverCandidate,
+) -> String {
+    let location = format!(
+        "{}:{}",
+        file_label_from_uri(document_uri),
+        candidate.range.start.line + 1
+    );
+    let render_parts = summarize_omena_query_style_hover_render_parts(
+        source,
+        candidate.kind,
+        candidate.name.as_str(),
+        candidate.range.start,
+    );
     match candidate.kind {
-        "selector" => format!(
-            "### .{}\n\nCSS Module selector from the Rust opened style document index.",
-            candidate.name
-        ),
-        "customPropertyReference" => format!(
-            "### var({})\n\nCSS custom property reference from the Rust opened style document index.",
-            candidate.name
-        ),
-        "customPropertyDeclaration" => format!(
-            "### {}\n\nCSS custom property declaration from the Rust opened style document index.",
-            candidate.name
-        ),
+        "selector" => {
+            format!(
+                "**`.{}`** - _{}_\n\n```scss\n{}\n```",
+                candidate.name, location, render_parts.snippet
+            )
+        }
+        "customPropertyReference" => {
+            format!(
+                "**`var({})`** - _{}_\n\n```scss\n{}\n```",
+                candidate.name, location, render_parts.snippet
+            )
+        }
+        "customPropertyDeclaration" => {
+            format!(
+                "**`{}`** - _{}_\n\n```scss\n{}\n```",
+                candidate.name, location, render_parts.snippet
+            )
+        }
+        kind if is_sass_symbol_candidate_kind(kind) => {
+            render_sass_symbol_hover_markdown(candidate, location.as_str(), &render_parts)
+        }
         _ => candidate.name.clone(),
+    }
+}
+
+fn render_sass_symbol_hover_markdown(
+    candidate: &LspStyleHoverCandidate,
+    location: &str,
+    render_parts: &omena_query::OmenaQueryStyleHoverRenderPartsV0,
+) -> String {
+    let label = render_sass_symbol_label(candidate);
+    match sass_symbol_kind_from_candidate_kind(candidate.kind) {
+        Some("variable") if is_sass_symbol_declaration_kind(candidate.kind) => {
+            if let Some(value) = render_parts.value.as_deref() {
+                return format!(
+                    "**`{}`** - _{}_\n\nValue: `{}`\n\n```scss\n{}\n```",
+                    label, location, value, render_parts.snippet
+                );
+            }
+            format!(
+                "**`{}`** - _{}_\n\n```scss\n{}\n```",
+                label, location, render_parts.snippet
+            )
+        }
+        Some("mixin" | "function") if is_sass_symbol_declaration_kind(candidate.kind) => {
+            let rendered_label = render_parts.signature.as_deref().unwrap_or(label.as_str());
+            format!(
+                "**`{}`** - _{}_\n\n```scss\n{}\n```",
+                rendered_label, location, render_parts.snippet
+            )
+        }
+        _ => {
+            format!(
+                "**`{}`** - _{}_\n\n```scss\n{}\n```",
+                label, location, render_parts.snippet
+            )
+        }
     }
 }
 
@@ -3273,14 +3439,6 @@ fn include_declaration_from_params(params: Option<&Value>) -> bool {
         .and_then(|value| value.get("includeDeclaration"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-fn end_of_document_range(source: &str) -> ParserRangeV0 {
-    let position = parser_position_for_byte_offset(source, source.len());
-    ParserRangeV0 {
-        start: position,
-        end: position,
-    }
 }
 
 fn file_label_from_uri(uri: &str) -> &str {
@@ -3339,177 +3497,103 @@ fn collect_style_hover_candidates(
     uri: &str,
     text: &str,
 ) -> Option<(&'static str, Vec<LspStyleHoverCandidate>)> {
-    let sheet = parse_style_module(uri, text)?;
-    let index = summarize_css_modules_intermediate(&sheet);
-    let mut seen = BTreeSet::new();
-    let mut candidates = Vec::new();
-    collect_style_selector_hover_candidates_from_nodes(
-        sheet.source.as_str(),
-        sheet.nodes.as_slice(),
-        &mut seen,
-        &mut candidates,
-    );
-    collect_custom_property_hover_candidates(
-        sheet.source.as_str(),
-        index.custom_properties.decl_facts.as_slice(),
-        index.custom_properties.ref_names.as_slice(),
-        &mut seen,
-        &mut candidates,
-    );
-    candidates.sort();
-    Some((style_language_label(sheet.language), candidates))
+    let summary = summarize_omena_query_style_hover_candidates(uri, text)?;
+    Some((
+        summary.language,
+        summary
+            .candidates
+            .into_iter()
+            .map(lsp_style_hover_candidate_from_query)
+            .collect(),
+    ))
 }
 
-fn collect_style_selector_hover_candidates_from_nodes(
-    source: &str,
-    nodes: &[SyntaxNode],
-    seen: &mut BTreeSet<(usize, usize, String)>,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    for node in nodes {
-        if let Some(SyntaxNodePayload::Rule(rule)) = &node.payload {
-            let header_span = node.header_span.unwrap_or(node.span);
-            for name in class_segment_names(rule) {
-                for byte_span in class_name_byte_spans_in_header(source, header_span, name) {
-                    if seen.insert((byte_span.start, byte_span.end, name.to_string())) {
-                        candidates.push(LspStyleHoverCandidate {
-                            kind: "selector",
-                            name: name.to_string(),
-                            range: parser_range_for_byte_span(source, byte_span),
-                            source: "openedStyleDocumentIndex",
-                            target_style_uri: None,
-                        });
-                    }
-                }
-            }
-        }
-        collect_style_selector_hover_candidates_from_nodes(
-            source,
-            node.children.as_slice(),
-            seen,
-            candidates,
-        );
+fn lsp_style_hover_candidate_from_query(
+    candidate: OmenaQueryStyleHoverCandidateV0,
+) -> LspStyleHoverCandidate {
+    LspStyleHoverCandidate {
+        kind: candidate.kind,
+        name: candidate.name,
+        range: candidate.range,
+        source: candidate.source,
+        target_style_uri: None,
+        namespace: candidate.namespace,
     }
 }
 
-fn class_segment_names(rule: &RulePayload) -> Vec<&str> {
-    rule.selector_groups
-        .iter()
-        .flat_map(|group| {
-            group.segments.iter().filter_map(|segment| match segment {
-                SelectorSegment::ClassName(name) => Some(name.as_str()),
-                _ => None,
-            })
-        })
-        .collect()
+fn query_style_hover_candidate_from_lsp(
+    candidate: &LspStyleHoverCandidate,
+) -> OmenaQueryStyleHoverCandidateV0 {
+    OmenaQueryStyleHoverCandidateV0 {
+        kind: candidate.kind,
+        name: candidate.name.clone(),
+        range: candidate.range,
+        source: candidate.source,
+        namespace: candidate.namespace.clone(),
+    }
 }
 
-fn class_name_byte_spans_in_header(
-    source: &str,
-    header_span: TextSpan,
+fn query_source_selector_candidate_from_lsp(
+    candidate: &LspStyleHoverCandidate,
+) -> OmenaQuerySourceSelectorCandidateV0 {
+    OmenaQuerySourceSelectorCandidateV0 {
+        kind: candidate.kind,
+        name: candidate.name.clone(),
+        range: candidate.range,
+        source: candidate.source,
+        target_style_uri: candidate.target_style_uri.clone(),
+    }
+}
+
+fn lsp_source_selector_candidate_from_query(
+    candidate: OmenaQuerySourceSelectorCandidateV0,
+) -> LspStyleHoverCandidate {
+    LspStyleHoverCandidate {
+        kind: candidate.kind,
+        name: candidate.name,
+        range: candidate.range,
+        source: candidate.source,
+        target_style_uri: candidate.target_style_uri,
+        namespace: None,
+    }
+}
+
+fn query_style_selector_definition(
+    uri: &str,
+    definition: &LspStyleHoverCandidate,
+) -> OmenaQueryStyleSelectorDefinitionV0 {
+    OmenaQueryStyleSelectorDefinitionV0 {
+        uri: uri.to_string(),
+        name: definition.name.clone(),
+        range: definition.range,
+    }
+}
+
+fn query_source_selector_reference_edit_target(
+    document: &LspTextDocumentState,
+    candidate: &LspStyleHoverCandidate,
+) -> OmenaQuerySourceSelectorReferenceEditTargetV0 {
+    OmenaQuerySourceSelectorReferenceEditTargetV0 {
+        uri: document.uri.clone(),
+        name: candidate.name.clone(),
+        range: candidate.range,
+        target_style_uri: candidate.target_style_uri.clone(),
+    }
+}
+
+fn query_definition_identity(
+    uri: &str,
     name: &str,
-) -> Vec<ParserByteSpanV0> {
-    let header = &source[header_span.start..header_span.end];
-    let needle = format!(".{name}");
-    let mut spans = Vec::new();
-    let mut search_offset = 0usize;
-
-    while let Some(relative_match) = header[search_offset..].find(&needle) {
-        let dot_start = header_span.start + search_offset + relative_match;
-        let name_start = dot_start + 1;
-        let name_end = name_start + name.len();
-        if is_selector_name_boundary(source, name_end) {
-            spans.push(ParserByteSpanV0 {
-                start: name_start,
-                end: name_end,
-            });
-        }
-        search_offset += relative_match + needle.len();
-    }
-
-    spans
-}
-
-fn collect_custom_property_hover_candidates(
-    source: &str,
-    decl_facts: &[engine_style_parser::ParserIndexCustomPropertyDeclFactV0],
-    ref_names: &[String],
-    seen: &mut BTreeSet<(usize, usize, String)>,
-    candidates: &mut Vec<LspStyleHoverCandidate>,
-) {
-    for fact in decl_facts {
-        if seen.insert((fact.byte_span.start, fact.byte_span.end, fact.name.clone())) {
-            candidates.push(LspStyleHoverCandidate {
-                kind: "customPropertyDeclaration",
-                name: fact.name.clone(),
-                range: fact.range,
-                source: "openedStyleDocumentIndex",
-                target_style_uri: None,
-            });
-        }
-    }
-
-    for name in ref_names {
-        for byte_span in custom_property_ref_byte_spans(source, name) {
-            if seen.insert((byte_span.start, byte_span.end, name.clone())) {
-                candidates.push(LspStyleHoverCandidate {
-                    kind: "customPropertyReference",
-                    name: name.clone(),
-                    range: parser_range_for_byte_span(source, byte_span),
-                    source: "openedStyleDocumentIndex",
-                    target_style_uri: None,
-                });
-            }
-        }
-    }
-}
-
-fn custom_property_ref_byte_spans(source: &str, name: &str) -> Vec<ParserByteSpanV0> {
-    let mut spans = Vec::new();
-    let mut search_offset = 0usize;
-
-    while let Some(relative_match) = source[search_offset..].find(name) {
-        let name_start = search_offset + relative_match;
-        let name_end = name_start + name.len();
-        if source[..name_start].trim_end().ends_with("var(")
-            && is_selector_name_boundary(source, name_end)
-        {
-            spans.push(ParserByteSpanV0 {
-                start: name_start,
-                end: name_end,
-            });
-        }
-        search_offset += relative_match + name.len();
-    }
-
-    spans
-}
-
-fn is_selector_name_boundary(source: &str, byte_offset: usize) -> bool {
-    source[byte_offset..]
-        .chars()
-        .next()
-        .is_none_or(|ch| !is_css_identifier_continue(ch))
-}
-
-fn is_js_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
-    let before = source[..start]
-        .chars()
-        .next_back()
-        .is_none_or(|ch| !is_js_identifier_continue(ch));
-    let after = source[end..]
-        .chars()
-        .next()
-        .is_none_or(|ch| !is_js_identifier_continue(ch));
-    before && after
-}
-
-fn is_js_identifier_start(ch: char) -> bool {
-    ch.is_ascii_alphabetic() || matches!(ch, '_' | '$')
-}
-
-fn is_js_identifier_continue(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')
+    range: ParserRangeV0,
+) -> (String, String, usize, usize, usize, usize) {
+    (
+        uri.to_string(),
+        name.to_string(),
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character,
+    )
 }
 
 fn is_css_identifier_continue(ch: char) -> bool {
@@ -3598,6 +3682,26 @@ fn style_language_label(language: StyleLanguage) -> &'static str {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn fixture_parent<'a>(
+        path: &'a Path,
+        context: &'static str,
+    ) -> Result<&'a Path, Box<dyn std::error::Error>> {
+        path.parent()
+            .ok_or_else(|| std::io::Error::other(context).into())
+    }
+
+    fn fixture_find(
+        source: &str,
+        needle: &str,
+        context: &'static str,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        source
+            .find(needle)
+            .ok_or_else(|| std::io::Error::other(context).into())
+    }
+
     #[test]
     fn declares_current_node_lsp_capability_contract() {
         let capabilities = current_node_lsp_capability_contract();
@@ -3635,14 +3739,25 @@ mod tests {
                 .contains(&"noFullWorkspaceProgramOnRequestPath")
         );
         assert!(
-            summary
+            !summary
                 .next_decoupling_targets
                 .contains(&"tsgoJsonRpcProviderImplementation")
         );
         assert!(
             summary
+                .tsgo_client_boundary
+                .ready_surfaces
+                .contains(&"jsonRpcTypeFactProviderImplementation")
+        );
+        assert!(
+            !summary
                 .next_decoupling_targets
                 .contains(&"thinVsCodeClientHost")
+        );
+        assert!(
+            !summary
+                .next_decoupling_targets
+                .contains(&"multiEditorDistribution")
         );
         assert!(
             summary
@@ -3658,8 +3773,30 @@ mod tests {
         assert!(
             summary
                 .thin_client_endpoint
+                .host_responsibilities
+                .contains(&"buildThinClientServerOptions")
+        );
+        assert!(
+            summary
+                .thin_client_endpoint
                 .rust_responsibilities
                 .contains(&"ownTsgoClientLifecycle")
+        );
+        assert_eq!(
+            summary.multi_editor_distribution.product,
+            "omena-lsp-server.multi-editor-distribution"
+        );
+        assert!(
+            summary
+                .multi_editor_distribution
+                .supported_editors
+                .contains(&"neovim")
+        );
+        assert!(
+            summary
+                .multi_editor_distribution
+                .endpoint_policy
+                .contains(&"nodeLspServerIsNotPrimaryEndpoint")
         );
         assert!(
             summary
@@ -4593,6 +4730,429 @@ mod tests {
     }
 
     #[test]
+    fn resolves_sass_internal_symbols_through_wildcard_import_targets() -> TestResult {
+        let workspace_path = std::env::temp_dir().join(format!(
+            "omena-lsp-sass-symbols-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let source_style_path = workspace_path.join("src/Card.module.scss");
+        let target_style_path = workspace_path.join("src/shared/_utils.scss");
+        fs::create_dir_all(fixture_parent(
+            target_style_path.as_path(),
+            "target style fixture path has parent directory",
+        )?)?;
+        fs::create_dir_all(fixture_parent(
+            source_style_path.as_path(),
+            "source style fixture path has parent directory",
+        )?)?;
+        fs::write(
+            workspace_path.join("tsconfig.json"),
+            r#"{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "$shared/*": ["src/shared/*"]
+    }
+  }
+}"#,
+        )?;
+        let source_text = "@import \"$shared/utils\";\n.title {\n  @include defign_typography20;\n  border-top: 1px solid $defign_gray200;\n}\n";
+        let target_text =
+            "$defign_gray200: #eee;\n@mixin defign_typography20 { font-size: 20px; }\n";
+        fs::write(source_style_path.as_path(), source_text)?;
+        fs::write(target_style_path.as_path(), target_text)?;
+
+        let workspace_uri = path_to_file_uri(workspace_path.as_path());
+        let source_uri = path_to_file_uri(source_style_path.as_path());
+        let target_uri = path_to_file_uri(target_style_path.as_path());
+        let mixin_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "defign_typography20",
+                "source fixture contains mixin include",
+            )?,
+        );
+        let variable_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "$defign_gray200",
+                "source fixture contains variable reference",
+            )? + 1,
+        );
+
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": workspace_uri,
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": source_text,
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": target_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": target_text,
+                    },
+                },
+            }),
+        );
+
+        let mixin_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": mixin_position,
+                },
+            }),
+        );
+        assert_eq!(
+            mixin_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!(target_uri)),
+        );
+        assert_eq!(
+            mixin_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/range")),
+            Some(&json!({
+                "start": {
+                    "line": 1,
+                    "character": 7,
+                },
+                "end": {
+                    "line": 1,
+                    "character": 26,
+                },
+            })),
+        );
+
+        let variable_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": variable_position,
+                },
+            }),
+        );
+        assert_eq!(
+            variable_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!(target_uri)),
+        );
+        assert_eq!(
+            variable_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/range")),
+            Some(&json!({
+                "start": {
+                    "line": 0,
+                    "character": 1,
+                },
+                "end": {
+                    "line": 0,
+                    "character": 15,
+                },
+            })),
+        );
+
+        let variable_hover = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": variable_position,
+                },
+            }),
+        );
+        assert_eq!(
+            variable_hover
+                .as_ref()
+                .and_then(|value| value.pointer("/result/contents/kind")),
+            Some(&json!("markdown")),
+        );
+        assert_eq!(
+            variable_hover
+                .as_ref()
+                .and_then(|value| value.pointer("/result/range")),
+            Some(&json!({
+                "start": {
+                    "line": 3,
+                    "character": 24,
+                },
+                "end": {
+                    "line": 3,
+                    "character": 39,
+                },
+            })),
+        );
+        let variable_hover_text = variable_hover
+            .as_ref()
+            .and_then(|value| value.pointer("/result/contents/value"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| std::io::Error::other("variable hover should render markdown"))?;
+        assert!(variable_hover_text.contains("Value: `#eee`"));
+        assert!(variable_hover_text.contains("$defign_gray200: #eee;"));
+
+        let mixin_hover = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": mixin_position,
+                },
+            }),
+        );
+        let mixin_hover_text = mixin_hover
+            .as_ref()
+            .and_then(|value| value.pointer("/result/contents/value"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| std::io::Error::other("mixin hover should render markdown"))?;
+        assert!(mixin_hover_text.contains("@mixin defign_typography20"));
+        assert!(mixin_hover_text.contains("font-size: 20px;"));
+
+        let _ = fs::remove_dir_all(workspace_path.as_path());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_sass_namespace_symbols_through_forwarded_alias_targets() -> TestResult {
+        let workspace_path = std::env::temp_dir().join(format!(
+            "omena-lsp-sass-forward-symbols-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let source_path = workspace_path.join("src").join("App.module.scss");
+        let index_path = workspace_path
+            .join("src")
+            .join("shared")
+            .join("_index.scss");
+        let tokens_path = workspace_path
+            .join("src")
+            .join("shared")
+            .join("_tokens.scss");
+        fs::create_dir_all(fixture_parent(
+            tokens_path.as_path(),
+            "tokens fixture path has parent directory",
+        )?)?;
+        fs::write(
+            workspace_path.join("tsconfig.json"),
+            r#"{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "$shared/*": ["src/shared/*"]
+    }
+  }
+}"#,
+        )?;
+        fs::write(index_path.as_path(), r#"@forward "./tokens";"#)?;
+        let target_text = r#"$gap: 1rem;
+@mixin raised { box-shadow: none; }
+@function tone($value) { @return $value; }
+"#;
+        fs::write(tokens_path.as_path(), target_text)?;
+        let source_text = r#"@use "$shared/index" as tokens;
+.button {
+  color: tokens.$gap;
+  @include tokens.raised;
+  border-color: tokens.tone(tokens.$gap);
+}
+"#;
+        fs::write(source_path.as_path(), source_text)?;
+
+        let workspace_uri = path_to_file_uri(workspace_path.as_path());
+        let source_uri = path_to_file_uri(source_path.as_path());
+        let index_uri = path_to_file_uri(index_path.as_path());
+        let tokens_uri = path_to_file_uri(tokens_path.as_path());
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": workspace_uri,
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        for (uri, text) in [
+            (source_uri.as_str(), source_text),
+            (index_uri.as_str(), r#"@forward "./tokens";"#),
+            (tokens_uri.as_str(), target_text),
+        ] {
+            handle_lsp_message(
+                &mut state,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "scss",
+                            "version": 1,
+                            "text": text,
+                        },
+                    },
+                }),
+            );
+        }
+
+        let gap_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "$gap",
+                "source fixture contains namespaced variable",
+            )?,
+        );
+        let gap_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": gap_position,
+                },
+            }),
+        );
+        assert_eq!(
+            gap_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!(tokens_uri)),
+        );
+
+        let mixin_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "raised",
+                "source fixture contains namespaced mixin",
+            )?,
+        );
+        let mixin_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": mixin_position,
+                },
+            }),
+        );
+        assert_eq!(
+            mixin_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!(tokens_uri)),
+        );
+
+        let function_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "tone",
+                "source fixture contains namespaced function",
+            )?,
+        );
+        let function_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": function_position,
+                },
+            }),
+        );
+        assert_eq!(
+            function_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!(tokens_uri)),
+        );
+
+        let _ = fs::remove_dir_all(workspace_path.as_path());
+        Ok(())
+    }
+
+    #[test]
     fn resolves_classnames_bind_source_definition_from_opened_documents() {
         let mut state = LspShellState::default();
         handle_lsp_message(
@@ -4680,6 +5240,1114 @@ mod tests {
                     "character": 5,
                 },
             })),
+        );
+    }
+
+    #[test]
+    fn projects_tsgo_type_facts_for_typed_cx_identifiers_and_template_holes() -> TestResult {
+        let source_uri = "file:///workspace-a/src/App.tsx";
+        let style_uri = "file:///workspace-a/src/App.module.scss";
+        let source_text = r#"import bind from "classnames/bind";
+import styles from "./App.module.scss";
+const cx = bind.bind(styles);
+interface BadgeProps { size: "medium" | "small"; fontSize?: 10 | 12; }
+export function Badge({ size, fontSize }: BadgeProps) {
+  return <span className={cx(size, `font-size-${fontSize}`)} />;
+}"#;
+        let style_text = ".medium { color: red; }\n.small { color: blue; }\n.font-size-10 { font-size: 10px; }\n.font-size-12 { font-size: 12px; }";
+
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": "file:///workspace-a",
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": source_text,
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": style_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": style_text,
+                    },
+                },
+            }),
+        );
+
+        let type_fact_targets = state
+            .document(source_uri)
+            .ok_or_else(|| std::io::Error::other("source document should be indexed"))?
+            .source_syntax_index
+            .type_fact_targets
+            .clone();
+        let size_target = type_fact_targets
+            .iter()
+            .find(|target| &source_text[target.byte_span.start..target.byte_span.end] == "size")
+            .ok_or_else(|| std::io::Error::other("size type fact target should exist"))?;
+        let font_size_target = type_fact_targets
+            .iter()
+            .find(|target| &source_text[target.byte_span.start..target.byte_span.end] == "fontSize")
+            .ok_or_else(|| std::io::Error::other("fontSize type fact target should exist"))?;
+        apply_source_type_fact_results_to_document(
+            &mut state,
+            source_uri,
+            &[
+                TsgoTypeFactResultEntryV0 {
+                    file_path: "/workspace-a/src/App.tsx".to_string(),
+                    expression_id: size_target.expression_id.clone(),
+                    resolved_type: TsgoResolvedTypeV0 {
+                        kind: "union",
+                        values: vec!["medium".to_string(), "small".to_string()],
+                    },
+                },
+                TsgoTypeFactResultEntryV0 {
+                    file_path: "/workspace-a/src/App.tsx".to_string(),
+                    expression_id: font_size_target.expression_id.clone(),
+                    resolved_type: TsgoResolvedTypeV0 {
+                        kind: "union",
+                        values: vec!["10".to_string(), "12".to_string()],
+                    },
+                },
+            ],
+        );
+
+        let size_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": parser_position_for_byte_offset(source_text, size_target.byte_span.start),
+                },
+            }),
+        );
+        let size_results = size_definition
+            .as_ref()
+            .and_then(|value| value.pointer("/result"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| std::io::Error::other("size definition should return results"))?;
+        assert_eq!(size_results.len(), 2);
+        assert_eq!(size_results[0].get("uri"), Some(&json!(style_uri)));
+        assert_eq!(size_results[1].get("uri"), Some(&json!(style_uri)));
+
+        let font_size_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": parser_position_for_byte_offset(source_text, font_size_target.byte_span.start),
+                },
+            }),
+        );
+        let font_size_results = font_size_definition
+            .as_ref()
+            .and_then(|value| value.pointer("/result"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| std::io::Error::other("fontSize definition should return results"))?;
+        assert_eq!(font_size_results.len(), 2);
+
+        let size_hover = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": parser_position_for_byte_offset(source_text, size_target.byte_span.start),
+                },
+            }),
+        );
+        let hover_text = size_hover
+            .as_ref()
+            .and_then(|value| value.pointer("/result/contents/value"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| std::io::Error::other("size hover should render markdown"))?;
+        assert!(hover_text.contains("`.medium`"));
+        assert!(hover_text.contains("`.small`"));
+        Ok(())
+    }
+
+    #[test]
+    fn indexes_sass_map_prefix_include_generated_selectors_for_source_prefixes() -> TestResult {
+        let source_uri = "file:///workspace-a/src/App.tsx";
+        let style_uri = "file:///workspace-a/src/App.module.scss";
+        let source_text = r#"import bind from "classnames/bind";
+import styles from "./App.module.scss";
+const cx = bind.bind(styles);
+export const view = <span className={cx(color && `color-${color}`)} />;
+"#;
+        let style_text = r#"@include setAllStyle(
+  ("green": #0f0, "blue": #00f),
+  background-color,
+  ".primary.fill",
+  $prefix: "color"
+);
+"#;
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": "file:///workspace-a",
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": source_text,
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": style_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": style_text,
+                    },
+                },
+            }),
+        );
+
+        let color_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "color-${color}",
+                "source fixture contains color template prefix",
+            )?,
+        );
+        let definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": color_position,
+                },
+            }),
+        );
+        let results = definition
+            .as_ref()
+            .and_then(|value| value.pointer("/result"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                std::io::Error::other("color prefix definition should return results")
+            })?;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].get("uri"), Some(&json!(style_uri)));
+        assert_eq!(results[1].get("uri"), Some(&json!(style_uri)));
+        Ok(())
+    }
+
+    #[test]
+    fn narrows_source_completion_candidates_by_property_access_prefix() -> TestResult {
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": "file:///workspace-a",
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": "import styles from \"./App.module.scss\";\nconst view = styles.ro;",
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.module.scss",
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": ".root { display: block; }\n.row { display: flex; }\n.active { color: red; }",
+                    },
+                },
+            }),
+        );
+
+        let completion_response = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                    },
+                    "position": {
+                        "line": 1,
+                        "character": 22,
+                    },
+                },
+            }),
+        );
+
+        let items = completion_response
+            .as_ref()
+            .and_then(|value| value.pointer("/result/items"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| std::io::Error::other("completion response should contain items"))?;
+        let labels: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.get("label")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect();
+        assert_eq!(labels, vec!["root".to_string(), "row".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_classnames_bind_source_definition_through_tsconfig_path_alias() -> TestResult {
+        let workspace_path = std::env::temp_dir().join(format!(
+            "omena-lsp-path-alias-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let target_style_path = workspace_path
+            .join("src")
+            .join("domain")
+            .join("components")
+            .join("some-component.module.scss");
+        fs::create_dir_all(fixture_parent(
+            target_style_path.as_path(),
+            "target style fixture path has parent directory",
+        )?)?;
+        fs::write(
+            workspace_path.join("tsconfig.json"),
+            r#"{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "$domain/*": ["src/domain/*"]
+    }
+  }
+}"#,
+        )?;
+        fs::write(target_style_path.as_path(), ".article { display: block; }")?;
+
+        let workspace_uri = path_to_file_uri(workspace_path.as_path());
+        let source_uri = path_to_file_uri(workspace_path.join("src/App.tsx").as_path());
+        let target_style_uri = path_to_file_uri(target_style_path.as_path());
+        let unrelated_style_uri =
+            path_to_file_uri(workspace_path.join("src/other.module.scss").as_path());
+
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": workspace_uri,
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": "import bind from \"classnames/bind\";\nimport styles from \"$domain/components/some-component.module.scss\";\nconst cx = bind.bind(styles);\nexport const className = cx(\"article\");",
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": target_style_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": ".article { display: block; }",
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": unrelated_style_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": ".article { color: red; }",
+                    },
+                },
+            }),
+        );
+
+        let source_index = state
+            .document(source_uri.as_str())
+            .map(|document| document.source_syntax_index.clone());
+        assert_eq!(
+            source_index
+                .as_ref()
+                .map(|index| index.imported_style_bindings.as_slice()),
+            Some(
+                [ImportedStyleBinding {
+                    binding: "styles".to_string(),
+                    style_uri: target_style_uri.clone(),
+                }]
+                .as_slice()
+            ),
+        );
+
+        let definition_response = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                    },
+                    "position": {
+                        "line": 3,
+                        "character": 31,
+                    },
+                },
+            }),
+        );
+
+        assert_eq!(
+            definition_response
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!(target_style_uri)),
+        );
+        assert_eq!(
+            definition_response
+                .as_ref()
+                .and_then(|value| value.pointer("/result/1/uri")),
+            None,
+        );
+
+        let _ = fs::remove_dir_all(workspace_path.as_path());
+        Ok(())
+    }
+
+    #[test]
+    fn source_hover_renders_unopened_target_style_rule_from_disk() -> TestResult {
+        let workspace_path = std::env::temp_dir().join(format!(
+            "omena-lsp-disk-style-hover-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let src_dir = workspace_path.join("src");
+        let source_path = src_dir.join("App.tsx");
+        let style_path = src_dir.join("App.module.scss");
+        fs::create_dir_all(src_dir.as_path())?;
+        fs::write(style_path.as_path(), ".foo { color: red; }\n")?;
+
+        let workspace_uri = path_to_file_uri(workspace_path.as_path());
+        let source_uri = path_to_file_uri(source_path.as_path());
+        let source_text = "import bind from \"classnames/bind\";\nimport styles from \"./App.module.scss\";\nconst cx = bind.bind(styles);\nexport const view = <div className={cx(\"foo\")} />;";
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": workspace_uri,
+                            "name": "workspace",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": source_text,
+                    },
+                },
+            }),
+        );
+
+        let hover_response = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {
+                        "uri": path_to_file_uri(source_path.as_path()),
+                    },
+                    "position": parser_position_for_byte_offset(
+                        source_text,
+                        fixture_find(source_text, "\"foo\"", "source fixture contains foo")? + 1,
+                    ),
+                },
+            }),
+        );
+        let hover_text = hover_response
+            .as_ref()
+            .and_then(|value| value.pointer("/result/contents/value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            hover_text.contains("color: red"),
+            "hover text: {hover_text}"
+        );
+
+        let _ = fs::remove_dir_all(workspace_path.as_path());
+        Ok(())
+    }
+
+    #[test]
+    fn sass_symbol_hover_renders_unopened_target_definition_from_disk() -> TestResult {
+        let workspace_path = std::env::temp_dir().join(format!(
+            "omena-lsp-disk-sass-hover-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let src_dir = workspace_path.join("src");
+        let source_style_path = src_dir.join("App.module.scss");
+        let token_style_path = src_dir.join("_tokens.scss");
+        fs::create_dir_all(src_dir.as_path())?;
+        fs::write(token_style_path.as_path(), "$brand: #fff;\n")?;
+
+        let workspace_uri = path_to_file_uri(workspace_path.as_path());
+        let source_style_uri = path_to_file_uri(source_style_path.as_path());
+        let source_style_text = "@use \"./tokens\" as *;\n.foo { color: $brand; }\n";
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": workspace_uri,
+                            "name": "workspace",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_style_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": source_style_text,
+                    },
+                },
+            }),
+        );
+
+        let hover_response = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": {
+                        "uri": path_to_file_uri(source_style_path.as_path()),
+                    },
+                    "position": parser_position_for_byte_offset(
+                        source_style_text,
+                        fixture_find(
+                            source_style_text,
+                            "$brand",
+                            "style fixture contains brand variable",
+                        )? + 1,
+                    ),
+                },
+            }),
+        );
+        let hover_text = hover_response
+            .as_ref()
+            .and_then(|value| value.pointer("/result/contents/value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(hover_text.contains("$brand: #fff"));
+
+        let _ = fs::remove_dir_all(workspace_path.as_path());
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_classnames_bind_dynamic_source_expressions() -> TestResult {
+        let source_text = r#"import bind from "classnames/bind";
+import styles from "./styles.module.scss";
+const cx = bind.bind(styles);
+const tone = "item--primary";
+const icon = { glyph: "item__icon" };
+const prefix = "item--";
+export const view = <div className={cx(tone, icon.glyph, `item--${variant}`, { "item--danger": danger, item__label: true }, ok && "item--ok", active ? "item--on" : "item--off", prefix + state)} />;
+"#;
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": "file:///workspace-a",
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": source_text,
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/styles.module.scss",
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": ".item--primary {}\n.item__icon {}\n.item--large {}\n.item--danger {}\n.item__label {}\n.item--ok {}\n.item--on {}\n.item--off {}\n.item--muted {}\n",
+                    },
+                },
+            }),
+        );
+
+        let tone_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "tone,",
+                "source fixture contains tone reference",
+            )?,
+        );
+        let tone_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                    },
+                    "position": tone_position,
+                },
+            }),
+        );
+        assert_eq!(
+            tone_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/range")),
+            Some(&json!({
+                "start": {
+                    "line": 0,
+                    "character": 1,
+                },
+                "end": {
+                    "line": 0,
+                    "character": 14,
+                },
+            })),
+        );
+
+        let icon_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "icon.glyph",
+                "source fixture contains object property reference",
+            )?,
+        );
+        let icon_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                    },
+                    "position": icon_position,
+                },
+            }),
+        );
+        assert_eq!(
+            icon_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/range")),
+            Some(&json!({
+                "start": {
+                    "line": 1,
+                    "character": 1,
+                },
+                "end": {
+                    "line": 1,
+                    "character": 11,
+                },
+            })),
+        );
+
+        let template_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "`item--",
+                "source fixture contains template prefix reference",
+            )? + 1,
+        );
+        let template_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                    },
+                    "position": template_position,
+                },
+            }),
+        );
+        let template_targets = template_definition
+            .as_ref()
+            .and_then(|value| value.pointer("/result"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            template_targets
+                .iter()
+                .any(|target| target.pointer("/range/start/line") == Some(&json!(2)))
+        );
+        assert!(
+            !template_targets
+                .iter()
+                .any(|target| target.pointer("/range/start/line") == Some(&json!(1)))
+        );
+
+        let object_key_position = parser_position_for_byte_offset(
+            source_text,
+            fixture_find(
+                source_text,
+                "item__label",
+                "source fixture contains object key reference",
+            )?,
+        );
+        let object_key_definition = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                    },
+                    "position": object_key_position,
+                },
+            }),
+        );
+        assert_eq!(
+            object_key_definition
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/range/start/line")),
+            Some(&json!(4)),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_source_references_from_asi_imports_without_panicking() {
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": "file:///workspace-a",
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": "import {WidgetA, WidgetB} from \"@repo/widgets\"\nimport styles from \"./styles.module.scss\"\nconst view = <div className={styles.root} />",
+                    },
+                },
+            }),
+        );
+        let source_index = state
+            .document("file:///workspace-a/src/App.tsx")
+            .map(|document| document.source_syntax_index.clone());
+        assert_eq!(
+            source_index
+                .as_ref()
+                .map(|index| index.imported_style_bindings.as_slice()),
+            Some(
+                [ImportedStyleBinding {
+                    binding: "styles".to_string(),
+                    style_uri: "file:///workspace-a/src/styles.module.scss".to_string(),
+                }]
+                .as_slice()
+            ),
+        );
+
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/styles.module.scss",
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": ".root { display: block; }",
+                    },
+                },
+            }),
+        );
+
+        let definition_response = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                    },
+                    "position": {
+                        "line": 2,
+                        "character": 37,
+                    },
+                },
+            }),
+        );
+
+        assert_eq!(
+            definition_response
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/uri")),
+            Some(&json!("file:///workspace-a/src/styles.module.scss")),
+        );
+        assert_eq!(
+            definition_response
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/range")),
+            Some(&json!({
+                "start": {
+                    "line": 0,
+                    "character": 1,
+                },
+                "end": {
+                    "line": 0,
+                    "character": 5,
+                },
+            })),
+        );
+    }
+
+    #[test]
+    fn opens_source_with_multibyte_escaped_strings_without_panicking() {
+        let source_text = r#"import bind from "classnames/bind";
+import styles from "./styles.module.scss";
+const cx = bind.bind(styles);
+const label = "\비";
+export const view = <div className={cx("root", label && `상태-${tone}`)} />;
+"#;
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": "file:///workspace-a",
+                            "name": "workspace-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": "file:///workspace-a/src/App.tsx",
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": source_text,
+                    },
+                },
+            }),
+        );
+
+        let source_index = state
+            .document("file:///workspace-a/src/App.tsx")
+            .map(|document| document.source_syntax_index.clone());
+        assert!(
+            source_index
+                .as_ref()
+                .is_some_and(|index| !index.selector_references.is_empty())
+        );
+    }
+
+    #[test]
+    fn workspace_folder_compatibility_normalizes_percent_encoded_route_groups() {
+        assert!(workspace_folder_uri_equivalent(
+            "file:///workspace/app/(marketing)",
+            "file:///workspace/app/%28marketing%29",
+        ));
+    }
+
+    #[test]
+    fn codelens_keeps_references_when_workspace_owner_uri_encoding_differs() {
+        let workspace_uri = "file:///workspace/(group-a)";
+        let encoded_workspace_uri = "file:///workspace/%28group-a%29";
+        let source_uri = "file:///workspace/%28group-a%29/src/App.tsx";
+        let style_uri = "file:///workspace/(group-a)/src/App.module.scss";
+        let mut state = LspShellState::default();
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "workspaceFolders": [
+                        {
+                            "uri": workspace_uri,
+                            "name": "group-a",
+                        },
+                    ],
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": source_uri,
+                        "languageId": "typescriptreact",
+                        "version": 1,
+                        "text": "import bind from \"classnames/bind\";\nimport styles from \"./App.module.scss\";\nconst cx = bind.bind(styles);\nexport const view = <div className={cx(\"foo\")} />;",
+                    },
+                },
+            }),
+        );
+        handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": style_uri,
+                        "languageId": "scss",
+                        "version": 1,
+                        "text": ".foo { color: red; }",
+                    },
+                },
+            }),
+        );
+        if let Some(document) = state.documents.get_mut(source_uri) {
+            document.workspace_folder_uri = Some(encoded_workspace_uri.to_string());
+        }
+
+        let code_lens_response = handle_lsp_message(
+            &mut state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/codeLens",
+                "params": {
+                    "textDocument": {
+                        "uri": style_uri,
+                    },
+                },
+            }),
+        );
+        assert_eq!(
+            code_lens_response
+                .as_ref()
+                .and_then(|value| value.pointer("/result/0/command/title")),
+            Some(&json!("1 reference")),
         );
     }
 
